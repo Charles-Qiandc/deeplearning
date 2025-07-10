@@ -1,0 +1,10 @@
+processed_data/
+training_data/
+checkpoints/
+model_config/*.yml
+wandb/*
+!models/
+!data/
+siglip-so400m-patch14-384/
+t5-v1_1-xxl/
+dinov2-large/
