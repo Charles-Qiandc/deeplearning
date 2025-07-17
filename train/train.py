@@ -449,16 +449,11 @@ def train(args, logger):
                 #         vision_features = dinov2_encoder(dinov2_input)  # (B, 256, 1024)
                 if dinov2_encoder is not None and "dinov2_images" in batch:
                     with torch.no_grad():
-                        dinov2_images = batch["dinov2_images"].to(dtype=weight_dtype)  # (B, 1, 3, 224, 224)
-                        if dinov2_images.dim() == 5:
-                            dinov2_input = dinov2_images[:, 0]  # (B, 3, 224, 224)
-                        elif dinov2_images.dim() == 4:
-                            dinov2_input = dinov2_images
-                        elif dinov2_images.dim() == 3:
-                            dinov2_input = dinov2_images.unsqueeze(0)
-                        else:
-                            raise ValueError(f"Unexpected dinov2_images shape: {dinov2_images.shape}")
-                        vision_features = dinov2_encoder(dinov2_input)  # (B, 256, 1024)
+                        dinov2_images = batch["dinov2_images"].to(dtype=weight_dtype)
+                        dinov2_input = dinov2_images[:, 0]  # (B, 3, 224, 224)
+                        # 🔄 修改：只提取CLS token
+                        dinov2_features = dinov2_encoder(dinov2_input)  # (B, 257, 1024)
+                        cls_token = dinov2_features[:, 0:1, :]  # (B, 1, 1024) - 只要CLS token
 
                 state_elem_mask = state_elem_mask.unsqueeze(1)
                 
@@ -472,7 +467,7 @@ def train(args, logger):
                         action_gt=actions,
                         action_mask=state_elem_mask,
                         ctrl_freqs=ctrl_freqs,
-                        vision_features=vision_features,  # 🆕
+                        cls_token=cls_token,
                     )
                     loss = total_loss
                     

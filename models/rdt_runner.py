@@ -104,74 +104,33 @@ class RDTRunner(
             [p.numel() for p in self.img_adaptor.parameters()] + 
             [p.numel() for p in self.state_adaptor.parameters()]))
 
-    def compute_repa_loss(self, action_tokens, vision_features):
+    def compute_repa_loss(self, action_tokens, cls_token):
         """
-        🆕 核心方法：计算REPA风格的对齐损失
-        
-        Args:
-            action_tokens: (B, horizon, hidden_size) 第4层的动作token
-            vision_features: (B, N_patches, dinov2_dim) DINOv2视觉特征
-        
-        Returns:
-            repa_loss: 标量损失值
+        推荐版本：正值余弦相似度损失
         """
-        if not self.enable_repa_loss or vision_features is None:
-            return torch.tensor(0.0, device=action_tokens.device, dtype=action_tokens.dtype)
-        
         B, horizon, hidden_size = action_tokens.shape
-        B_v, N_patches, dinov2_dim = vision_features.shape
         
-        # 验证输入维度
-        assert B == B_v, f"批次大小不匹配: {B} vs {B_v}"
+        # 投影到视觉特征空间
+        action_tokens_flat = action_tokens.reshape(-1, hidden_size)
+        projected_actions = self.model.action_to_vision_projector(action_tokens_flat)
+        projected_actions = projected_actions.reshape(B, horizon, -1)
         
-        print(f"🔍 REPA损失计算:")
-        print(f"   - 动作token: {action_tokens.shape}")
-        print(f"   - 视觉特征: {vision_features.shape}")
+        # 计算余弦相似度
+        cls_token_expanded = cls_token.expand(-1, horizon, -1)
+        cosine_similarities = F.cosine_similarity(
+            projected_actions, cls_token_expanded, dim=-1
+        )  # 范围[-1, 1]
         
-        # 确保视觉特征是正确的数据类型
-        vision_features = vision_features.to(action_tokens.dtype)
+        mean_cosine_similarity = cosine_similarities.mean()
         
-        # Step 1: 投影动作token到视觉特征空间
-        action_tokens_flat = action_tokens.reshape(-1, hidden_size)  # (B*horizon, hidden_size)
-        projected_actions = self.model.action_to_vision_projector(action_tokens_flat)  # (B*horizon, dinov2_dim)
-        projected_actions = projected_actions.reshape(B, horizon, dinov2_dim)  # (B, horizon, dinov2_dim)
-        
-        print(f"   - 投影后动作: {projected_actions.shape}")
-        
-        # Step 2: L2归一化特征
-        projected_actions = F.normalize(projected_actions, dim=-1)  # (B, horizon, dinov2_dim)
-        vision_features = F.normalize(vision_features, dim=-1)      # (B, N_patches, dinov2_dim)
-        
-        # Step 3: 计算对齐损失 (全局对齐策略)
-        total_loss = 0.0
-        similarities = []
-        
-        for b in range(B):
-            # 每个batch单独计算余弦相似度
-            action_feat = projected_actions[b]  # (horizon, dinov2_dim)
-            vision_feat = vision_features[b]    # (N_patches, dinov2_dim)
-            
-            # 计算相似度矩阵: (horizon, N_patches)
-            similarity_matrix = torch.mm(action_feat, vision_feat.t())
-            
-            # 对每个动作token，找到最相似的视觉patch
-            max_similarity, best_patch_idx = similarity_matrix.max(dim=1)  # (horizon,)
-            similarities.append(max_similarity.mean().item())
-            
-            # 负相似度作为损失 (鼓励高相似度)
-            batch_loss = -max_similarity.mean()
-            total_loss += batch_loss
-        
-        repa_loss = total_loss / B
-        
-        print(f"   - 平均相似度: {sum(similarities)/len(similarities):.4f}")
-        print(f"   - REPA损失: {repa_loss.item():.4f}")
+        # 转换为正值损失：1 - cosine_similarity
+        repa_loss = 1.0 - mean_cosine_similarity  # 范围[0, 2]
         
         return repa_loss
 
     def compute_loss(self, lang_tokens, lang_attn_mask, img_tokens, 
                      state_tokens, action_gt, action_mask, ctrl_freqs,
-                     vision_features=None  # 🆕 DINOv2视觉特征
+                     cls_token=None  # 🆕 DINOv2视觉特征
                     ):
         """
         🔄 修改：计算总损失，包括扩散损失和REPA对齐损失
@@ -238,10 +197,10 @@ class RDTRunner(
         repa_loss = torch.tensor(0.0, device=device, dtype=diffusion_loss.dtype)
         if self.enable_repa_loss and 'action_tokens_for_repa' in intermediate_activations:
             action_tokens = intermediate_activations['action_tokens_for_repa']
-            if vision_features is not None:
-                vision_features = vision_features.to(self.dtype)
-            repa_loss = self.compute_repa_loss(action_tokens, vision_features)
-        
+            if cls_token is not None:
+                cls_token = cls_token.to(self.dtype)
+                repa_loss = self.compute_repa_loss(action_tokens, cls_token)
+            
         # 总损失 = 扩散损失 + 加权对齐损失
         total_loss = diffusion_loss + self.repa_loss_weight * repa_loss
         
