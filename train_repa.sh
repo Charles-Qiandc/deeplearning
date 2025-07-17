@@ -28,7 +28,7 @@ export NCCL_DEBUG=INFO
 export TEXT_ENCODER_NAME="google/t5-v1_1-xxl"
 export VISION_ENCODER_NAME="../weights/RDT/siglip-so400m-patch14-384"
 export WANDB_PROJECT="RDT_REPA"
-export WANDB_DEFAULT_RUN_NAME="${CONFIG_NAME}_repa"
+export WANDB_DEFAULT_RUN_NAME="${CONFIG_NAME}"
 
 # Read key training settings from config
 TRAIN_BATCH_SIZE=$(python scripts/read_yaml.py "$CONFIG_FILE" train_batch_size)

@@ -156,7 +156,7 @@ def train(args, logger):
     dinov2_encoder = None
     if use_dinov2_features and enable_repa_loss:
         logger.info("🔧 加载DINOv2编码器...")
-        dinov2_encoder = create_dinov2_encoder(model_size="large", select_feature="patch")
+        dinov2_encoder = create_dinov2_encoder(model_size="large", select_feature="cls_only")
         dinov2_encoder.to(accelerator.device, dtype=weight_dtype)
         dinov2_encoder.print_model_info()
 
@@ -341,10 +341,10 @@ def train(args, logger):
     # Initialize the trackers
     if accelerator.is_main_process:
         accelerator.init_trackers(
-            "VLA",
+            "VLA_REPA",
             config=vars(args),
             init_kwargs={"wandb": {
-                "name": f"RoboTwin_RDT_REPA_{args.CONFIG_NAME}",
+                "name": f"RDT_REPA_{args.CONFIG_NAME}",
             }},
         )
 
@@ -451,15 +451,11 @@ def train(args, logger):
                     with torch.no_grad():
                         dinov2_images = batch["dinov2_images"].to(dtype=weight_dtype)
                         dinov2_input = dinov2_images[:, 0]  # (B, 3, 224, 224)
-                        # 🔄 修改：只提取CLS token
-                        dinov2_features = dinov2_encoder(dinov2_input)  # (B, 257, 1024)
-                        cls_token = dinov2_features[:, 0:1, :]  # (B, 1, 1024) - 只要CLS token
+                        cls_token = dinov2_encoder(dinov2_input)  # (B, 1, 1024) - 直接是CLS token
 
                 state_elem_mask = state_elem_mask.unsqueeze(1)
-                
-                # 🔄 修改：传入vision_features
                 if enable_repa_loss:
-                    total_loss, diffusion_loss, repa_loss = rdt.module.compute_loss(
+                    total_loss, diffusion_loss, repa_loss = accelerator.unwrap_model(rdt).compute_loss(
                         lang_tokens=text_embeds,
                         lang_attn_mask=lang_attn_mask,
                         img_tokens=image_embeds,

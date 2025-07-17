@@ -58,11 +58,6 @@ class RDT(nn.Module):
         self.repa_activation_layer = repa_activation_layer - 1  # 转换为0-based索引
         self.dinov2_feature_dim = dinov2_feature_dim
         
-        print(f"🔧 RDT初始化配置:")
-        print(f"   - 层数: {depth} (原28层)")
-        print(f"   - REPA启用: {enable_repa_loss}")
-        print(f"   - REPA激活层: {repa_activation_layer}")
-        print(f"   - DINOv2特征维度: {dinov2_feature_dim}")
 
         # 原有的嵌入器组件
         self.t_embedder = TimestepEmbedder(hidden_size, dtype=dtype)
@@ -94,7 +89,6 @@ class RDT(nn.Module):
                 nn.Linear(projector_dim, dinov2_feature_dim),
             )
             
-            print(f"   - 投影器维度: {hidden_size} -> {projector_dim} -> {dinov2_feature_dim}")
         
         self.final_layer = FinalLayer(hidden_size, output_dim)
         self.initialize_weights()
@@ -205,8 +199,6 @@ class RDT(nn.Module):
                 # 提取动作部分 (去除前缀: timestep, freq, state)
                 action_tokens = x[:, -self.horizon:, :]  # (B, horizon, hidden_size)
                 intermediate_activations['action_tokens_for_repa'] = action_tokens
-                
-                print(f"🔍 第{i+1}层提取动作token: {action_tokens.shape}")
 
         # 最终输出层
         x = self.final_layer(x)                         # (B, T+2, output_dim)

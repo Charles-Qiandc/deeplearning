@@ -204,10 +204,6 @@ class RDTRunner(
         # 总损失 = 扩散损失 + 加权对齐损失
         total_loss = diffusion_loss + self.repa_loss_weight * repa_loss
         
-        print(f"💰 损失详情:")
-        print(f"   - 扩散损失: {diffusion_loss.item():.4f}")
-        print(f"   - REPA损失: {repa_loss.item():.4f}")
-        print(f"   - 总损失: {total_loss.item():.4f}")
         
         return total_loss, diffusion_loss, repa_loss
 

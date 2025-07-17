@@ -53,15 +53,12 @@ class DinoV2VisionTower(nn.Module):
         if self.select_feature == 'patch':
             # 去除CLS token，只保留patch tokens
             image_features = image_features[:, 1:]  # (B, num_patches, hidden_size)
-            print(f"🔍 Patch tokens shape: {image_features.shape}")
         elif self.select_feature == 'cls_patch':
             # 保留所有tokens (CLS + patches)
             image_features = image_features  # (B, num_patches+1, hidden_size)
-            print(f"🔍 CLS+Patch tokens shape: {image_features.shape}")
         elif self.select_feature == 'cls_only':
             # 只使用CLS token
             image_features = image_features[:, :1]  # (B, 1, hidden_size)
-            print(f"🔍 CLS token shape: {image_features.shape}")
         else:
             raise ValueError(f'Unexpected select feature: {self.select_feature}')
         
