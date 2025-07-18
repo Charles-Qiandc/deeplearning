@@ -152,15 +152,36 @@ class RoboticDiffusionTransformerModel(object):
             return
         print(f"Loading weights from {pretrained}")
         filename = os.path.basename(pretrained)
+        
         if filename.endswith(".pt"):
-            checkpoint = torch.load(pretrained)
+            checkpoint = torch.load(pretrained, map_location="cpu")
             self.policy.load_state_dict(checkpoint["module"])
+        elif filename.endswith(".bin"):
+            # 支持 .bin 格式 (HuggingFace 常用格式)
+            checkpoint = torch.load(pretrained, map_location="cpu")
+            # 尝试不同的键名，根据实际模型结构调整
+            if isinstance(checkpoint, dict):
+                if "module" in checkpoint:
+                    self.policy.load_state_dict(checkpoint["module"])
+                elif "model_state_dict" in checkpoint:
+                    self.policy.load_state_dict(checkpoint["model_state_dict"])
+                elif "state_dict" in checkpoint:
+                    self.policy.load_state_dict(checkpoint["state_dict"])
+                else:
+                    # 如果字典中没有预期的键，尝试直接加载整个字典
+                    try:
+                        self.policy.load_state_dict(checkpoint)
+                    except Exception as e:
+                        print(f"Warning: Failed to load state dict directly, available keys: {list(checkpoint.keys())}")
+                        raise e
+            else:
+                # 如果不是字典格式，假设它就是 state_dict
+                self.policy.load_state_dict(checkpoint)
         elif filename.endswith(".safetensors"):
             from safetensors.torch import load_model
-
             load_model(self.policy, pretrained)
         else:
-            raise NotImplementedError(f"Unknown checkpoint format: {pretrained}")
+            raise NotImplementedError(f"Unknown checkpoint format: {pretrained}. Supported formats: .pt, .bin, .safetensors")
 
     def encode_instruction(self, instruction, device="cuda"):
         """Encode string instruction to latent embeddings.

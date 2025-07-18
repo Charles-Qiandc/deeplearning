@@ -155,7 +155,7 @@ class RDT(nn.Module):
         if self.enable_repa_loss:
             for module in self.action_to_vision_projector:
                 if isinstance(module, nn.Linear):
-                    nn.init.xavier_uniform_(module.weight, gain=0.1)  # 较小的初始化
+                    nn.init.xavier_uniform_(module.weight, gain=0.5)  
                     if module.bias is not None:
                         nn.init.constant_(module.bias, 0)
         

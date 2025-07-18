@@ -22,7 +22,7 @@ def get_model(usr_args):  # keep
     rdt = RDT(
         os.path.join(
             parent_directory,
-            f"checkpoints/{model_name}/checkpoint-{checkpoint_id}/pytorch_model/mp_rank_00_model_states.pt",
+            f"checkpoints/{model_name}/checkpoint-{checkpoint_id}/pytorch_model.bin",#
         ),
         usr_args["task_name"],
         left_arm_dim,

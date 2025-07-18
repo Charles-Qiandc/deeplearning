@@ -1,6 +1,6 @@
 #!/bin/bash
 
-policy_name=RDT
+policy_name=RDT_repa
 task_name=${1}
 task_config=${2}
 model_name=${3}
