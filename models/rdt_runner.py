@@ -44,7 +44,7 @@ class RDTRunner(
             output_dim=action_dim,
             horizon=pred_horizon,
             hidden_size=hidden_size,
-            depth=8,  # 🔄 修改：固定8层
+            depth=28, 
             num_heads=config['rdt']['num_heads'],
             max_lang_cond_len=max_lang_cond_len,
             img_cond_len=img_cond_len,
@@ -106,25 +106,30 @@ class RDTRunner(
 
     def compute_repa_loss(self, action_tokens, cls_token):
         """
-        推荐版本：正值余弦相似度损失
+        优化版REPA损失：时间平均 + 高效计算
         """
         B, horizon, hidden_size = action_tokens.shape
         
+        # 🔄 关键优化：先对时间维度求平均，得到整体动作表示
+        action_mean = action_tokens.mean(dim=1)  # (B, 2048)
+        # 这样做的含义：整个动作序列的语义 vs 视觉场景的语义
+        
         # 投影到视觉特征空间
-        action_tokens_flat = action_tokens.reshape(-1, hidden_size)
-        projected_actions = self.model.action_to_vision_projector(action_tokens_flat)
-        projected_actions = projected_actions.reshape(B, horizon, -1)
+        projected_action = self.model.action_to_vision_projector(action_mean)  # (B, 1024)
+        
+        # 处理视觉特征
+        cls_token_squeezed = cls_token.squeeze(1)  # (B, 1024)
+        
+        # 🆕 L2归一化提升数值稳定性
+        projected_action = F.normalize(projected_action, p=2, dim=-1)
+        cls_token_norm = F.normalize(cls_token_squeezed, p=2, dim=-1)
         
         # 计算余弦相似度
-        cls_token_expanded = cls_token.expand(-1, horizon, -1)
-        cosine_similarities = F.cosine_similarity(
-            projected_actions, cls_token_expanded, dim=-1
-        )  # 范围[-1, 1]
+        cosine_similarity = F.cosine_similarity(projected_action, cls_token_norm, dim=-1)
+        mean_similarity = cosine_similarity.mean()
         
-        mean_cosine_similarity = cosine_similarities.mean()
-        
-        # 转换为正值损失：1 - cosine_similarity
-        repa_loss = 1.0 - mean_cosine_similarity  # 范围[0, 2]
+        # 转换为损失
+        repa_loss = 1.0 - mean_similarity
         
         return repa_loss
 

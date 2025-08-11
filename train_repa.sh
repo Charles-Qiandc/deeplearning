@@ -27,6 +27,7 @@ export NCCL_P2P_DISABLE=1
 export NCCL_DEBUG=INFO
 export TEXT_ENCODER_NAME="google/t5-v1_1-xxl"
 export VISION_ENCODER_NAME="../weights/RDT/siglip-so400m-patch14-384"
+export PRETRAINED_RDT="/home/deng_xiang/qian_daichao/RoboTwin/policy/weights/RDT/rdt-1b/pytorch_model.bin"
 export WANDB_PROJECT="RDT_REPA"
 export WANDB_DEFAULT_RUN_NAME="${CONFIG_NAME}"
 
@@ -77,6 +78,7 @@ python -m data.compute_dataset_stat_hdf5 --task_name $CONFIG_NAME
 echo "🏃 Launching training..."
 accelerate launch --main_process_port=28499 main.py \
     --deepspeed="./configs/zero2.json" \
+    --pretrained_model_name_or_path="$PRETRAINED_RDT" \
     --pretrained_text_encoder_name_or_path=$TEXT_ENCODER_NAME \
     --pretrained_vision_encoder_name_or_path=$VISION_ENCODER_NAME \
     --output_dir=$OUTPUT_DIR \

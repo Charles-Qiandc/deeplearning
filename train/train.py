@@ -160,18 +160,45 @@ def train(args, logger):
         dinov2_encoder.to(accelerator.device, dtype=weight_dtype)
         dinov2_encoder.print_model_info()
 
-    # Load from a pretrained checkpoint
-    if args.pretrained_model_name_or_path is not None and not os.path.isfile(args.pretrained_model_name_or_path):
-        logger.info("Constructing model from pretrained checkpoint.")
-        rdt = RDTRunner.from_pretrained(args.pretrained_model_name_or_path)
-    else:
-        logger.info("Constructing model from provided config.")
-        # Calculate the image condition length
-        img_cond_len = (config["common"]["img_history_size"] * config["common"]["num_cameras"] *
-                        vision_encoder.num_patches)
+    # # Load from a pretrained checkpoint
+    # if args.pretrained_model_name_or_path is not None and not os.path.isfile(args.pretrained_model_name_or_path):
+    #     logger.info("Constructing model from pretrained checkpoint.")
+    #     rdt = RDTRunner.from_pretrained(args.pretrained_model_name_or_path)
+    # else:
+    #     logger.info("Constructing model from provided config.")
+    #     # Calculate the image condition length
+    #     img_cond_len = (config["common"]["img_history_size"] * config["common"]["num_cameras"] *
+    #                     vision_encoder.num_patches)
         
-        # 🔄 修改：创建带REPA的RDTRunner
-        rdt = RDTRunner(
+    #     # 🔄 修改：创建带REPA的RDTRunner
+    #     rdt = RDTRunner(
+    #         action_dim=config["common"]["state_dim"],
+    #         pred_horizon=config["common"]["action_chunk_size"],
+    #         config=config["model"],
+    #         lang_token_dim=config["model"]["lang_token_dim"],
+    #         img_token_dim=config["model"]["img_token_dim"],
+    #         state_token_dim=config["model"]["state_token_dim"],
+    #         max_lang_cond_len=config["dataset"]["tokenizer_max_length"],
+    #         img_cond_len=img_cond_len,
+    #         img_pos_embed_config=[
+    #             ("image", (
+    #                 config["common"]["img_history_size"],
+    #                 config["common"]["num_cameras"],
+    #                 -vision_encoder.num_patches,
+    #             )),
+    #         ],
+    #         lang_pos_embed_config=[
+    #             ("lang", -config["dataset"]["tokenizer_max_length"]),
+    #         ],
+    #         dtype=weight_dtype,
+    #         enable_repa_loss=enable_repa_loss,  # 🆕
+    #         repa_loss_weight=repa_loss_weight,  # 🆕
+    #     )
+    
+    logger.info("Constructing (possibly modified) RDT runner from config.")
+    img_cond_len = (config["common"]["img_history_size"] * config["common"]["num_cameras"] *
+                    vision_encoder.num_patches)
+    rdt = RDTRunner(
             action_dim=config["common"]["state_dim"],
             pred_horizon=config["common"]["action_chunk_size"],
             config=config["model"],
@@ -194,6 +221,34 @@ def train(args, logger):
             enable_repa_loss=enable_repa_loss,  # 🆕
             repa_loss_weight=repa_loss_weight,  # 🆕
         )
+    if args.pretrained_model_name_or_path and os.path.isfile(args.pretrained_model_name_or_path):
+        logger.info(f"Loading pretrained weights from {args.pretrained_model_name_or_path}")
+        ckpt = torch.load(args.pretrained_model_name_or_path, map_location="cpu")
+
+        # 支持多种 checkpoint 格式
+        if isinstance(ckpt, dict) and "module" in ckpt:
+            pretrained_sd = ckpt["module"]
+        elif isinstance(ckpt, dict) and "state_dict" in ckpt:
+            pretrained_sd = ckpt["state_dict"]
+        else:
+            pretrained_sd = ckpt
+
+        # 过滤出和当前模型 shape 一致的参数
+        own_sd = rdt.state_dict()
+        filtered = {}
+        for k, v in pretrained_sd.items():
+            if k in own_sd and v.shape == own_sd[k].shape:
+                filtered[k] = v
+            else:
+                logger.debug(
+                    f"Skipping {k}: checkpoint {tuple(v.shape)} vs model {tuple(own_sd.get(k, v).shape)}"
+                )
+
+        # 增量加载匹配的参数，其余保持随机初始化
+        rdt.load_state_dict(filtered, strict=False)
+        logger.info("✅ Loaded all matching pretrained weights; others kept at random init.")
+    else:
+        logger.info("Using config only; skipping pretrained weight loading.")
 
     ema_rdt = copy.deepcopy(rdt)
     ema_model = EMAModel(
@@ -362,13 +417,6 @@ def train(args, logger):
     
     global_step = 0
     first_epoch = 0
-
-    # Load from a pretrained checkpoint
-    if (args.resume_from_checkpoint is None and args.pretrained_model_name_or_path is not None
-            and os.path.isfile(args.pretrained_model_name_or_path)):
-        logger.info("Loading from a pretrained checkpoint.")
-        checkpoint = torch.load(args.pretrained_model_name_or_path)
-        rdt.module.load_state_dict(checkpoint["module"])
 
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:

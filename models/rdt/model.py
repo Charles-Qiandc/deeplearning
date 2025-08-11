@@ -20,20 +20,14 @@ from models.rdt.blocks import (FinalLayer, RDTBlock, TimestepEmbedder,
 
 
 class RDT(nn.Module):
-    """
-    🔄 修改：Robotics Diffusion Transformers with REPA alignment loss
-    主要修改：
-    1. 减少层数从28到8
-    2. 添加REPA对齐投影器
-    3. 在第4层提取动作token用于对齐损失
-    """
+
     def __init__(
         self,
         output_dim=128,
-        horizon=32,
-        hidden_size=1152,
-        depth=8,  # 🔄 修改：从28减少到8
-        num_heads=16,
+        horizon=64,
+        hidden_size=2048,
+        depth=28,
+        num_heads=32,
         max_lang_cond_len=1024,
         img_cond_len=4096,
         lang_pos_embed_config=None,
@@ -41,7 +35,7 @@ class RDT(nn.Module):
         dtype=torch.bfloat16,
         # 🆕 REPA相关参数
         enable_repa_loss=True,
-        repa_activation_layer=4,
+        repa_activation_layer=21,
         dinov2_feature_dim=1024,  # DINOv2-L特征维度
     ):
         super().__init__()
@@ -71,22 +65,26 @@ class RDT(nn.Module):
         self.img_cond_pos_embed = nn.Parameter(
             torch.zeros(1, img_cond_len, hidden_size))
 
-        # 🔄 修改：减少到8层RDT块
+
         self.blocks = nn.ModuleList([
             RDTBlock(hidden_size, num_heads) for _ in range(depth)
         ])
         
         # 🆕 REPA对齐投影器
         if self.enable_repa_loss:
-            # 计算合适的投影器维度
-            projector_dim = max(hidden_size, dinov2_feature_dim * 2)  # 设置为较大值确保表达能力
             
             self.action_to_vision_projector = nn.Sequential(
-                nn.Linear(hidden_size, projector_dim),
+                # 第一层：保持维度，学习特征变换
+                nn.Linear(hidden_size, hidden_size),           # 2048 → 2048
                 nn.SiLU(),
-                nn.Linear(projector_dim, projector_dim),
+                nn.Dropout(0.1),  # 轻微正则化
+                
+                # 第二层：渐进压缩
+                nn.Linear(hidden_size, (hidden_size + dinov2_feature_dim) // 2),  # 2048 → 1536
                 nn.SiLU(),
-                nn.Linear(projector_dim, dinov2_feature_dim),
+                
+                # 第三层：映射到目标维度
+                nn.Linear((hidden_size + dinov2_feature_dim) // 2, dinov2_feature_dim),  # 1536 → 1024
             )
             
         
