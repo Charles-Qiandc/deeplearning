@@ -76,12 +76,12 @@ class DinoV2VisionTower(nn.Module):
             image_features = []
             for image in images:
                 # 确保图像尺寸正确
-                if image.shape[-2:] != (224, 224):
-                    print(f"⚠️ Warning: Image size {image.shape[-2:]} != (224, 224). Resizing...")
+                if image.shape[-2:] != (518, 518):
+                    print(f"⚠️ Warning: Image size {image.shape[-2:]} != (518, 518). Resizing...")
                     image = torch.nn.functional.interpolate(
                         image.unsqueeze(0), 
-                        size=(224, 224), 
-                        mode='bilinear', 
+                        size=(518, 518), 
+                        mode='bilinear',
                         align_corners=False
                     ).squeeze(0)
                 
@@ -96,11 +96,11 @@ class DinoV2VisionTower(nn.Module):
                 raise ValueError(f"Expected 4D tensor (B,C,H,W), got {images.dim()}D tensor")
             
             # 检查并调整图像尺寸
-            if images.shape[-2:] != (224, 224):
-                print(f"⚠️ Warning: Image size {images.shape[-2:]} != (224, 224). Resizing...")
+            if images.shape[-2:] != (518, 518):
+                print(f"⚠️ Warning: Image size {images.shape[-2:]} != (518, 518). Resizing...")
                 images = torch.nn.functional.interpolate(
                     images, 
-                    size=(224, 224), 
+                    size=(518, 518), 
                     mode='bilinear', 
                     align_corners=False
                 )
@@ -149,8 +149,8 @@ class DinoV2VisionTower(nn.Module):
     @property
     def num_patches_per_side(self):
         """计算每边的patch数量"""
-        # DINOv2 使用 224x224 图像和 16x16 的 patch
-        # 对于 DINOv2，这应该返回 14 (224/16 = 14)
+        # DINOv2 使用 518x518 图像和 14x14 的 patch
+        # 对于 DINOv2，这应该返回 37 (518/14 = 37)
         if self.is_loaded:
             # 从配置中获取实际值
             image_size = self.config.image_size
@@ -165,7 +165,7 @@ class DinoV2VisionTower(nn.Module):
             return image_size // patch_size
         else:
             # DINOv2 的默认值
-            return 14  # 224 // 16
+            return 37
 
     @property
     def num_patches(self):

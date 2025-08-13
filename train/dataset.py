@@ -127,7 +127,7 @@ class VLAConsumerDataset(Dataset):
         
         # 🆕 DINOv2相关配置
         self.use_dinov2_features = use_dinov2_features
-        self.dinov2_image_size = 224  # DINOv2期望的输入尺寸
+        self.dinov2_image_size = 518  # DINOv2期望的输入尺寸
 
         # Load dataset stat
         with open("configs/dataset_stat.json", "r") as f:
@@ -317,30 +317,32 @@ class VLAConsumerDataset(Dataset):
 
                 # 🆕 为DINOv2准备单独的图像
                 if self.use_dinov2_features:
-                    dinov2_images = []
-                    # 只使用第一个相机（external camera）的当前帧
-                    for j in range(1):  # 只处理第一个相机
-                        images, image_mask = image_metas[j]
-                        # 使用最新的帧（最后一个时间步）
-                        image, valid = images[self.img_history_size - 1], image_mask[self.img_history_size - 1]
-                        if valid and (math.prod(image.shape) > 0):
-                            # 调整为DINOv2的输入尺寸
-                            pil_image = Image.fromarray(image)
-                            pil_image = pil_image.resize((self.dinov2_image_size, self.dinov2_image_size), Image.BILINEAR)
-                            # 简单的归一化
-                            image_array = np.array(pil_image).astype(np.float32) / 255.0
-                            image_tensor = torch.from_numpy(image_array).permute(2, 0, 1)  # HWC -> CHW
-                            # 标准化
-                            mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-                            std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-                            image_tensor = (image_tensor - mean) / std
-                            dinov2_images.append(image_tensor)
-                        else:
-                            # 创建空白图像
-                            empty_tensor = torch.zeros(3, self.dinov2_image_size, self.dinov2_image_size)
-                            dinov2_images.append(empty_tensor)
+                    # 明确使用第一个相机的最新帧
+                    camera_idx = 0
+                    frame_idx = self.img_history_size - 1
                     
-                    data_dict["dinov2_images"] = torch.stack(dinov2_images, dim=0)  # (1, 3, 224, 224)
+                    if camera_idx >= len(image_metas):
+                        raise ValueError(f"相机索引 {camera_idx} 超出范围")
+                    
+                    images, image_mask = image_metas[camera_idx]
+                    image, valid = images[frame_idx], image_mask[frame_idx]
+                    
+                    if not valid or math.prod(image.shape) <= 0:
+                        raise ValueError(f"DINOv2图像无效")
+                    
+                    # 预处理
+                    pil_image = Image.fromarray(image)
+                    pil_image = pil_image.resize((self.dinov2_image_size, self.dinov2_image_size), Image.BILINEAR)
+                    image_array = np.array(pil_image).astype(np.float32) / 255.0
+                    image_tensor = torch.from_numpy(image_array).permute(2, 0, 1)
+                    
+                    # 标准化
+                    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                    image_tensor = (image_tensor - mean) / std
+                    
+                    # 添加batch维度并保存
+                    data_dict["dinov2_images"] = image_tensor.unsqueeze(0)  # (1, 3, H, W)
 
                 # 处理原始图像
                 preprocessed_images = []

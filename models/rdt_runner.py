@@ -44,7 +44,7 @@ class RDTRunner(
             output_dim=action_dim,
             horizon=pred_horizon,
             hidden_size=hidden_size,
-            depth=28, 
+            depth=config['rdt']['depth'], 
             num_heads=config['rdt']['num_heads'],
             max_lang_cond_len=max_lang_cond_len,
             img_cond_len=img_cond_len,
