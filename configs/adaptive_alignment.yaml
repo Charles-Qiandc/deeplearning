@@ -1,0 +1,150 @@
+# configs/adaptive_alignment.yaml
+
+# 自适应对齐总配置
+adaptive_alignment:
+  enable: true
+  version: "1.0"
+  
+  # ===== 路由网络配置 =====
+  routing:
+    # 基础参数
+    num_experts: 2  # 专家数量（全局语义 + 深度几何）
+    input_dim: 2048  # 输入动作token维度
+    hidden_dim: 512  # 路由网络隐藏层维度
+    
+    # Gumbel Softmax参数
+    use_gumbel: true  # 使用Gumbel Softmax实现可微分采样
+    temperature_init: 1.0  # 初始温度
+    temperature_min: 0.1  # 最小温度
+    temperature_decay: 0.999  # 温度衰减率
+    
+    # 损失权重
+    load_balance_weight: 0.01  # 负载均衡损失权重
+    entropy_weight: 0.01  # 熵正则化权重
+    supervised_weight: 1.0  # 监督损失权重（如果有标签）
+    
+  # ===== 对齐通道配置 =====
+  alignment_channels:
+    # 全局语义对齐（DINOv2）
+    global:
+      vision_dim: 1024  # DINOv2特征维度
+      hidden_dim: 1536  # 投影器隐藏层维度
+      dropout: 0.1
+      temperature: 0.07  # 对比学习温度
+      
+    # 深度几何对齐（DepthAnythingV2）
+    depth:
+      depth_dim: 1024  # 深度特征维度
+      hidden_dim: 1536
+      num_heads: 8  # 交叉注意力头数
+      dropout: 0.1
+      
+  # ===== 损失权重配置 =====
+  loss_weights:
+    alignment: 1.0  # 对齐损失基础权重
+    routing: 0.1  # 路由损失权重
+    auxiliary: 0.01  # 辅助损失权重
+    
+    # 自适应权重调整
+    adaptive_weighting: true
+    weight_decay_rate: 0.95  # 权重衰减率
+    min_weight: 0.1  # 最小权重
+    max_weight: 2.0  # 最大权重
+    
+  # ===== 训练调度配置 =====
+  scheduler:
+    # 预热阶段
+    warmup_steps: 1000  # 预热步数
+    warmup_start_weight: 0.0  # 预热起始权重
+    
+    # 路由引入阶段
+    routing_warmup_ratio: 0.3  # 路由预热比例
+    routing_start_step: 500  # 开始引入路由的步数
+    
+    # 温度退火
+    temperature_schedule: "exponential"  # linear, exponential, cosine
+    temperature_end_step: 10000
+    
+    # 监督衰减
+    supervised_decay_start: 5000  # 开始减少监督的步数
+    supervised_decay_rate: 0.99
+    
+  # ===== 深度编码器配置 =====
+  depth_encoder:
+    model_size: "vits"  # vits, vitb, vitl
+    feature_dim: 1024  # 输出特征维度
+    use_intermediate_features: true  # 使用中间层特征
+    cache_features: true  # 缓存特征以加速
+    
+  # ===== 关键时间段标注配置 =====
+  annotation:
+    # 速度策略
+    velocity_threshold: 0.01  # 速度阈值
+    velocity_weight: 0.4  # 策略权重
+    
+    # 加速度策略
+    acceleration_threshold: 0.05
+    acceleration_weight: 0.3
+    
+    # 曲率策略
+    curvature_threshold: 0.3
+    curvature_weight: 0.2
+    
+    # 夹爪策略
+    gripper_threshold: 0.1
+    gripper_weight: 0.1
+    
+    # 通用参数
+    window_size: 5  # 平滑窗口大小
+    expand_steps: 3  # 关键段扩展步数
+    ensemble_method: "weighted"  # voting, weighted, cascade
+    
+    # 自动调整
+    auto_adjust_thresholds: true  # 自动调整阈值
+    threshold_percentile: 20  # 阈值百分位数
+    
+  # ===== 推理配置 =====
+  inference:
+    use_ema_model: true  # 使用EMA模型推理
+    routing_temperature: 0.1  # 推理时的路由温度
+    hard_routing: true  # 推理时使用硬路由
+    expert_selection: "auto"  # auto, global, depth, both
+    
+  # ===== 监控和日志 =====
+  monitoring:
+    log_interval: 100  # 日志间隔
+    save_routing_stats: true  # 保存路由统计
+    save_alignment_scores: true  # 保存对齐分数
+    visualize_routing: true  # 可视化路由决策
+    
+    # 指标追踪
+    track_metrics:
+      - "routing_accuracy"
+      - "expert_usage"
+      - "alignment_similarity"
+      - "switch_rate"
+      - "temperature"
+      
+  # ===== 实验配置 =====
+  experiment:
+    ablation_mode: null  # null, no_routing, no_depth, no_global
+    debug_mode: false
+    profile_memory: false
+    
+# ===== 数据增强配置 =====
+data_augmentation:
+  # 用于训练路由网络的数据增强
+  augment_critical_labels: true
+  label_noise_rate: 0.1  # 标签噪声率
+  label_smooth_epsilon: 0.1  # 标签平滑
+  
+  # 时序增强
+  temporal_jitter: 0.1  # 时序抖动
+  temporal_mask_ratio: 0.15  # 时序掩码比例
+  
+# ===== 模型检查点配置 =====
+checkpoint:
+  save_router_separately: true  # 单独保存路由网络
+  save_alignment_modules: true  # 保存对齐模块
+  checkpoint_interval: 1000  # 检查点间隔
+  keep_last_n: 5  # 保留最近N个检查点
