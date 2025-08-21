@@ -27,8 +27,9 @@ from models.rdt_runner import RDTRunner
 from train.dataset import DataCollatorForVLAConsumerDataset, VLAConsumerDataset
 from train.sample import log_sample_res
 
-# 🆕 导入DINOv2编码器
+# 🆕 导入DINOv2和DepthAnythingV2编码器
 from models.multimodal_encoder.dinov2_encoder import create_dinov2_encoder
+from models.multimodal_encoder.depth_encoder import create_depth_encoder
 
 if is_wandb_available():
     import wandb
@@ -52,14 +53,19 @@ tags:
 - diffusion
 - rdt
 - repa
+- dual-teachers
 ---
     """
     model_card = f"""
-# RDT with REPA - {repo_id}
+# RDT with Dual-Teacher REPA - {repo_id}
 
-This is a RDT model with REPA alignment loss derived from {base_model}. 
+This is a RDT model with dual-teacher REPA alignment loss derived from {base_model}. 
 The weights were trained using [RDT](https://rdt-robotics.github.io/rdt-robotics/) 
-with additional visual alignment using DINOv2 features.
+with dual visual alignment using DINOv2 (global semantic) and DepthAnythingV2 (depth geometric) features.
+
+## Dual-Teacher Alignment Strategy
+- **Non-critical timesteps**: Action tokens align with DINOv2 CLS token (global semantics)
+- **Critical timesteps**: Action tokens align with DepthAnythingV2 CLS token (depth geometry)
 """
     with open(os.path.join(repo_folder, "README.md"), "w") as f:
         f.write(yaml + model_card)
@@ -127,15 +133,19 @@ def train(args, logger):
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
-    # 🆕 获取REPA配置
+    # 🆕 获取双教师REPA配置
     enable_repa_loss = model_config.get("enable_repa_loss", True)
     repa_loss_weight = model_config.get("repa_loss_weight", 0.2)
     use_dinov2_features = model_config.get("use_dinov2_features", True)
+    use_depth_features = model_config.get("use_depth_features", True)
+    routing_loss_weight = model_config.get("routing_loss_weight", 0.1)
     
-    logger.info(f"🔧 REPA配置:")
+    logger.info(f"🔧 双教师REPA配置:")
     logger.info(f"   - REPA损失启用: {enable_repa_loss}")
     logger.info(f"   - REPA损失权重: {repa_loss_weight}")
     logger.info(f"   - 使用DINOv2特征: {use_dinov2_features}")
+    logger.info(f"   - 使用深度特征: {use_depth_features}")
+    logger.info(f"   - 路由损失权重: {routing_loss_weight}")
 
     # 文本编码器
     if args.precomp_lang_embed:
@@ -152,80 +162,62 @@ def train(args, logger):
     vision_encoder = SiglipVisionTower(vision_tower=args.pretrained_vision_encoder_name_or_path, args=None)
     image_processor = vision_encoder.image_processor
 
-    # 🆕 创建DINOv2编码器
+    # 🆕 创建DINOv2编码器（全局语义特征）
     dinov2_encoder = None
     if use_dinov2_features and enable_repa_loss:
-        logger.info("🔧 加载DINOv2编码器...")
+        logger.info("🔧 加载DINOv2编码器（全局语义教师）...")
         dinov2_encoder = create_dinov2_encoder(model_size="large", select_feature="cls_only")
         dinov2_encoder.to(accelerator.device, dtype=weight_dtype)
         dinov2_encoder.print_model_info()
 
-    # # Load from a pretrained checkpoint
-    # if args.pretrained_model_name_or_path is not None and not os.path.isfile(args.pretrained_model_name_or_path):
-    #     logger.info("Constructing model from pretrained checkpoint.")
-    #     rdt = RDTRunner.from_pretrained(args.pretrained_model_name_or_path)
-    # else:
-    #     logger.info("Constructing model from provided config.")
-    #     # Calculate the image condition length
-    #     img_cond_len = (config["common"]["img_history_size"] * config["common"]["num_cameras"] *
-    #                     vision_encoder.num_patches)
-        
-    #     # 🔄 修改：创建带REPA的RDTRunner
-    #     rdt = RDTRunner(
-    #         action_dim=config["common"]["state_dim"],
-    #         pred_horizon=config["common"]["action_chunk_size"],
-    #         config=config["model"],
-    #         lang_token_dim=config["model"]["lang_token_dim"],
-    #         img_token_dim=config["model"]["img_token_dim"],
-    #         state_token_dim=config["model"]["state_token_dim"],
-    #         max_lang_cond_len=config["dataset"]["tokenizer_max_length"],
-    #         img_cond_len=img_cond_len,
-    #         img_pos_embed_config=[
-    #             ("image", (
-    #                 config["common"]["img_history_size"],
-    #                 config["common"]["num_cameras"],
-    #                 -vision_encoder.num_patches,
-    #             )),
-    #         ],
-    #         lang_pos_embed_config=[
-    #             ("lang", -config["dataset"]["tokenizer_max_length"]),
-    #         ],
-    #         dtype=weight_dtype,
-    #         enable_repa_loss=enable_repa_loss,  # 🆕
-    #         repa_loss_weight=repa_loss_weight,  # 🆕
-    #     )
-    
-    logger.info("Constructing (possibly modified) RDT runner from config.")
+    # 🆕 创建DepthAnythingV2编码器（深度几何特征）
+    depth_encoder = None
+    if use_depth_features and enable_repa_loss:
+        logger.info("🔧 加载DepthAnythingV2编码器（深度几何教师）...")
+        depth_encoder = create_depth_encoder(
+            model_size="vits",  # 使用小模型以节省显存
+            feature_dim=1024,   # 与DINOv2对齐
+            device=accelerator.device
+        )
+        depth_encoder.to(accelerator.device, dtype=weight_dtype)
+        depth_encoder.print_model_info()
+
+    # 构建RDT模型
+    logger.info("🔧 构建双教师RDT模型...")
     img_cond_len = (config["common"]["img_history_size"] * config["common"]["num_cameras"] *
                     vision_encoder.num_patches)
+    
     rdt = RDTRunner(
-            action_dim=config["common"]["state_dim"],
-            pred_horizon=config["common"]["action_chunk_size"],
-            config=config["model"],
-            lang_token_dim=config["model"]["lang_token_dim"],
-            img_token_dim=config["model"]["img_token_dim"],
-            state_token_dim=config["model"]["state_token_dim"],
-            max_lang_cond_len=config["dataset"]["tokenizer_max_length"],
-            img_cond_len=img_cond_len,
-            img_pos_embed_config=[
-                ("image", (
-                    config["common"]["img_history_size"],
-                    config["common"]["num_cameras"],
-                    -vision_encoder.num_patches,
-                )),
-            ],
-            lang_pos_embed_config=[
-                ("lang", -config["dataset"]["tokenizer_max_length"]),
-            ],
-            dtype=weight_dtype,
-            enable_repa_loss=enable_repa_loss,  # 🆕
-            repa_loss_weight=repa_loss_weight,  # 🆕
-        )
+        action_dim=config["common"]["state_dim"],
+        pred_horizon=config["common"]["action_chunk_size"],
+        config=config["model"],
+        lang_token_dim=config["model"]["lang_token_dim"],
+        img_token_dim=config["model"]["img_token_dim"],
+        state_token_dim=config["model"]["state_token_dim"],
+        max_lang_cond_len=config["dataset"]["tokenizer_max_length"],
+        img_cond_len=img_cond_len,
+        img_pos_embed_config=[
+            ("image", (
+                config["common"]["img_history_size"],
+                config["common"]["num_cameras"],
+                -vision_encoder.num_patches,
+            )),
+        ],
+        lang_pos_embed_config=[
+            ("lang", -config["dataset"]["tokenizer_max_length"]),
+        ],
+        dtype=weight_dtype,
+        enable_repa_loss=enable_repa_loss,
+        repa_loss_weight=repa_loss_weight,
+        use_dual_teachers=use_depth_features,  # 🆕 启用双教师模式
+        routing_loss_weight=routing_loss_weight,  # 🆕 路由损失权重
+    )
+    
+    # 加载预训练权重（如果提供）
     if args.pretrained_model_name_or_path and os.path.isfile(args.pretrained_model_name_or_path):
-        logger.info(f"Loading pretrained weights from {args.pretrained_model_name_or_path}")
+        logger.info(f"📥 加载预训练权重: {args.pretrained_model_name_or_path}")
         ckpt = torch.load(args.pretrained_model_name_or_path, map_location="cpu")
 
-        # 支持多种 checkpoint 格式
         if isinstance(ckpt, dict) and "module" in ckpt:
             pretrained_sd = ckpt["module"]
         elif isinstance(ckpt, dict) and "state_dict" in ckpt:
@@ -233,23 +225,20 @@ def train(args, logger):
         else:
             pretrained_sd = ckpt
 
-        # 过滤出和当前模型 shape 一致的参数
         own_sd = rdt.state_dict()
         filtered = {}
         for k, v in pretrained_sd.items():
             if k in own_sd and v.shape == own_sd[k].shape:
                 filtered[k] = v
             else:
-                logger.debug(
-                    f"Skipping {k}: checkpoint {tuple(v.shape)} vs model {tuple(own_sd.get(k, v).shape)}"
-                )
+                logger.debug(f"跳过参数 {k}: checkpoint {tuple(v.shape)} vs model {tuple(own_sd.get(k, v).shape)}")
 
-        # 增量加载匹配的参数，其余保持随机初始化
         rdt.load_state_dict(filtered, strict=False)
-        logger.info("✅ Loaded all matching pretrained weights; others kept at random init.")
+        logger.info("✅ 加载匹配的预训练权重；其余保持随机初始化")
     else:
-        logger.info("Using config only; skipping pretrained weight loading.")
+        logger.info("🎲 仅使用配置；跳过预训练权重加载")
 
+    # EMA模型
     ema_rdt = copy.deepcopy(rdt)
     ema_model = EMAModel(
         ema_rdt,
@@ -260,7 +249,7 @@ def train(args, logger):
         max_value=config["model"]["ema"]["max_value"],
     )
 
-    # create custom saving & loading hooks
+    # 保存钩子
     def save_model_hook(models, weights, output_dir):
         if accelerator.is_main_process:
             for model in models:
@@ -281,7 +270,7 @@ def train(args, logger):
         args.learning_rate = (args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size *
                               accelerator.num_processes)
 
-    # Use 8-bit Adam for lower memory usage
+    # 优化器
     if args.use_8bit_adam:
         try:
             import bitsandbytes as bnb
@@ -291,7 +280,6 @@ def train(args, logger):
     else:
         optimizer_class = torch.optim.AdamW
 
-    # Optimizer creation
     params_to_optimize = rdt.parameters()
     optimizer = optimizer_class(
         params_to_optimize,
@@ -301,7 +289,7 @@ def train(args, logger):
         eps=args.adam_epsilon,
     )
 
-    # Dataset and DataLoaders creation
+    # 数据集和数据加载器
     train_dataset = VLAConsumerDataset(
         model_config_path=args.model_config_path,
         config=config["dataset"],
@@ -316,7 +304,8 @@ def train(args, logger):
         state_noise_snr=args.state_noise_snr,
         use_hdf5=args.load_from_hdf5,
         use_precomp_lang_embed=args.precomp_lang_embed,
-        use_dinov2_features=use_dinov2_features,  # 🆕
+        use_dinov2_features=use_dinov2_features,
+        use_depth_features=use_depth_features,  # 🆕
     )
     
     sample_dataset = VLAConsumerDataset(
@@ -333,7 +322,8 @@ def train(args, logger):
         state_noise_snr=None,
         use_hdf5=args.load_from_hdf5,
         use_precomp_lang_embed=args.precomp_lang_embed,
-        use_dinov2_features=use_dinov2_features,  # 🆕
+        use_dinov2_features=use_dinov2_features,
+        use_depth_features=use_depth_features,  # 🆕
     )
 
     data_collator = DataCollatorForVLAConsumerDataset(tokenizer)
@@ -358,7 +348,7 @@ def train(args, logger):
         persistent_workers=True,
     )
 
-    # Scheduler and math around the number of training steps
+    # 学习率调度器
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
@@ -374,7 +364,7 @@ def train(args, logger):
         power=args.lr_power,
     )
 
-    # Prepare everything with our `accelerator`
+    # 准备训练
     rdt, optimizer, train_dataloader, sample_dataloader, lr_scheduler = (
         accelerator.prepare(rdt, optimizer, train_dataloader, sample_dataloader, lr_scheduler)
     )
@@ -387,58 +377,56 @@ def train(args, logger):
     if vision_encoder is not None:
         vision_encoder.vision_tower.to(accelerator.device, dtype=weight_dtype)
 
-    # We need to recalculate our total training steps
+    # 重新计算训练步数
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
-    # Initialize the trackers
+    # 初始化追踪器
     if accelerator.is_main_process:
         accelerator.init_trackers(
-            "VLA_REPA",
+            "VLA_Dual_Teacher_REPA",
             config=vars(args),
             init_kwargs={"wandb": {
-                "name": f"RDT_REPA_{args.CONFIG_NAME}",
+                "name": f"RDT_DualTeacher_{args.CONFIG_NAME}",
             }},
         )
 
-    # Train!
+    # 训练信息
     total_batch_size = (args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps)
 
-    logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
-    logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    logger.info("***** 开始双教师REPA训练 *****")
+    logger.info(f"  样本数量 = {len(train_dataset)}")
+    logger.info(f"  每epoch批次数 = {len(train_dataloader)}")
+    logger.info(f"  Epoch数 = {args.num_train_epochs}")
+    logger.info(f"  每设备瞬时批次大小 = {args.train_batch_size}")
+    logger.info(f"  总训练批次大小 = {total_batch_size}")
+    logger.info(f"  梯度累积步数 = {args.gradient_accumulation_steps}")
+    logger.info(f"  总优化步数 = {args.max_train_steps}")
     
     global_step = 0
     first_epoch = 0
 
-    # Potentially load in the weights and states from a previous save
+    # 可能从检查点恢复
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
             path = os.path.basename(args.resume_from_checkpoint)
         else:
-            # Get the most recent checkpoint
             dirs = os.listdir(args.output_dir)
             dirs = [d for d in dirs if d.startswith("checkpoint")]
             dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
             path = dirs[-1] if len(dirs) > 0 else None
 
         if path is None:
-            accelerator.print(
-                f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run.")
+            accelerator.print(f"检查点 '{args.resume_from_checkpoint}' 不存在。开始新的训练。")
             args.resume_from_checkpoint = None
         else:
-            accelerator.print(f"Resuming from checkpoint {path}")
+            accelerator.print(f"从检查点恢复: {path}")
             try:
                 accelerator.load_state(os.path.join(args.output_dir, path))
             except:
-                logger.info("Resuming training state failed. Attempting to only load from model checkpoint.")
+                logger.info("恢复训练状态失败。尝试仅加载模型检查点。")
                 checkpoint = torch.load(
                     os.path.join(args.output_dir, path, "pytorch_model", "mp_rank_00_model_states.pt"))
                 rdt.module.load_state_dict(checkpoint["module"])
@@ -450,7 +438,7 @@ def train(args, logger):
             first_epoch = global_step // num_update_steps_per_epoch
             resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
 
-    # Only show the progress bar once on each machine
+    # 进度条
     progress_bar = tqdm(
         range(global_step, args.max_train_steps),
         disable=not accelerator.is_local_main_process,
@@ -458,52 +446,75 @@ def train(args, logger):
     progress_bar.set_description("Steps")
 
     loss_for_log = {}
+    
+    # 训练循环
     for epoch in range(first_epoch, args.num_train_epochs):
         rdt.train()
 
-        # Set the progress_bar to correct position
         if args.resume_from_checkpoint and epoch == first_epoch:
             progress_bar.update(resume_step // args.gradient_accumulation_steps)
 
-        # Forward and backward
         for batch in train_dataloader:
             with accelerator.accumulate(rdt):
+                # 准备输入数据
                 images = batch["images"].to(dtype=weight_dtype)
-                states = batch["states"].to(dtype=weight_dtype)  # (B, T, D_a)
-                # We only use the last state as input
-                states = states[:, -1:, :]
+                states = batch["states"].to(dtype=weight_dtype)[:, -1:, :]  # 只使用最后一个状态
                 actions = batch["actions"].to(dtype=weight_dtype)
                 state_elem_mask = batch["state_elem_mask"].to(dtype=weight_dtype)
                 ctrl_freqs = batch["ctrl_freqs"]
 
-                # 原始图像编码
+                # 🆕 编码原始图像（SigLIP）
                 with torch.no_grad():
                     batch_size, _, C, H, W = images.shape
                     image_embeds = vision_encoder(images.reshape(-1, C, H, W)).detach()
                     image_embeds = image_embeds.reshape((batch_size, -1, vision_encoder.hidden_size))
 
                     lang_attn_mask = batch["lang_attn_mask"]
-                    text_embeds = (batch["lang_embeds"].to(
-                        dtype=weight_dtype) if args.precomp_lang_embed else text_encoder(
-                            input_ids=batch["input_ids"], attention_mask=lang_attn_mask)["last_hidden_state"].detach())
+                    text_embeds = (batch["lang_embeds"].to(dtype=weight_dtype) 
+                                 if args.precomp_lang_embed 
+                                 else text_encoder(input_ids=batch["input_ids"], 
+                                                 attention_mask=lang_attn_mask)["last_hidden_state"].detach())
 
-                # 🆕 提取DINOv2特征
-                vision_features = None
-                # if dinov2_encoder is not None and "dinov2_images" in batch:
-                #     with torch.no_grad():
-                #         dinov2_images = batch["dinov2_images"].to(dtype=weight_dtype)
-                #         # 只使用第一个相机的当前帧图像
-                #         dinov2_input = dinov2_images[:, 0]  # (B, C, H, W)
-                #         vision_features = dinov2_encoder(dinov2_input)  # (B, 256, 1024)
+                # 🆕 提取DINOv2全局语义特征
+                cls_token = None
                 if dinov2_encoder is not None and "dinov2_images" in batch:
                     with torch.no_grad():
                         dinov2_images = batch["dinov2_images"].to(dtype=weight_dtype)
-                        dinov2_input = dinov2_images[:, 0]  # (B, 3, 224, 224)
-                        cls_token = dinov2_encoder(dinov2_input)  # (B, 1, 1024) - 直接是CLS token
+                        dinov2_input = dinov2_images[:, 0]  # (B, 3, 518, 518)
+                        cls_token = dinov2_encoder(dinov2_input)  # (B, 1, 1024)
 
+                # 🆕 提取DepthAnythingV2深度几何特征
+                depth_features = None
+                if depth_encoder is not None and "depth_images" in batch:
+                    with torch.no_grad():
+                        depth_images = batch["depth_images"].to(dtype=weight_dtype)
+                        depth_input = depth_images[:, 0]  # (B, 3, 518, 518)
+                        depth_features, _ = depth_encoder(depth_input)  # (B, 1370, 1024)
+
+                # 🆕 生成关键时间段标签
+                critical_labels = None
+                if "qpos_trajectory" in batch and batch["qpos_trajectory"] is not None:
+                    from data.critical_timestep_annotator import AgilexDualKeypointAnnotator
+                    annotator = AgilexDualKeypointAnnotator()
+                    
+                    batch_critical_labels = []
+                    for i in range(batch["qpos_trajectory"].shape[0]):
+                        qpos = batch["qpos_trajectory"][i].cpu().numpy()
+                        labels, _ = annotator.annotate(qpos)
+                        # 只取前64步（对应action horizon）
+                        labels = labels[:config["common"]["action_chunk_size"]]
+                        if len(labels) < config["common"]["action_chunk_size"]:
+                            # 如果不足64步，用0填充
+                            padding = config["common"]["action_chunk_size"] - len(labels)
+                            labels = np.concatenate([labels, np.zeros(padding)])
+                        batch_critical_labels.append(torch.from_numpy(labels))
+                    
+                    critical_labels = torch.stack(batch_critical_labels).to(accelerator.device)
+
+                # 🆕 计算双教师REPA损失
                 state_elem_mask = state_elem_mask.unsqueeze(1)
                 if enable_repa_loss:
-                    total_loss, diffusion_loss, repa_loss = accelerator.unwrap_model(rdt).compute_loss(
+                    total_loss, diffusion_loss, repa_loss, routing_loss = accelerator.unwrap_model(rdt).compute_loss(
                         lang_tokens=text_embeds,
                         lang_attn_mask=lang_attn_mask,
                         img_tokens=image_embeds,
@@ -511,13 +522,22 @@ def train(args, logger):
                         action_gt=actions,
                         action_mask=state_elem_mask,
                         ctrl_freqs=ctrl_freqs,
-                        cls_token=cls_token,
+                        cls_token=cls_token,              # DINOv2 CLS token
+                        depth_features=depth_features,   # DepthAnythingV2特征（包含CLS）
+                        critical_labels=critical_labels, # 关键时间段标签
                     )
                     loss = total_loss
                     
-                    # 记录各项损失
+                    # 记录详细损失
                     loss_for_log["diffusion_loss"] = diffusion_loss.detach().item()
                     loss_for_log["repa_loss"] = repa_loss.detach().item()
+                    loss_for_log["routing_loss"] = routing_loss.detach().item()
+                    
+                    # 记录关键时间段统计
+                    if critical_labels is not None:
+                        critical_ratio = critical_labels.float().mean().item()
+                        loss_for_log["critical_ratio"] = critical_ratio
+                        
                 else:
                     # 原始方式
                     loss = rdt(
@@ -530,6 +550,7 @@ def train(args, logger):
                         ctrl_freqs=ctrl_freqs,
                     )
 
+                # 反向传播
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     params_to_clip = rdt.parameters()
@@ -538,9 +559,10 @@ def train(args, logger):
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=args.set_grads_to_none)
 
+            # EMA更新
             ema_model.step(accelerator.unwrap_model(rdt))
 
-            # Checks if the accelerator has performed an optimization step
+            # 检查点和采样
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
@@ -550,13 +572,13 @@ def train(args, logger):
                     accelerator.save_state(save_path)
                     ema_save_path = os.path.join(save_path, f"ema")
                     accelerator.save_model(ema_rdt, ema_save_path)
-                    logger.info(f"Saved state to {save_path}")
+                    logger.info(f"💾 保存状态到 {save_path}")
 
                 if args.sample_period > 0 and global_step % args.sample_period == 0:
                     sample_loss_for_log = log_sample_res(
                         text_encoder,
                         vision_encoder,
-                        rdt,  # We do not use EMA currently
+                        rdt,
                         args,
                         accelerator,
                         weight_dtype,
@@ -567,6 +589,7 @@ def train(args, logger):
                     logger.info(sample_loss_for_log)
                     accelerator.log(sample_loss_for_log, step=global_step)
 
+            # 记录日志
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             logs.update(loss_for_log)
@@ -575,14 +598,14 @@ def train(args, logger):
             if global_step >= args.max_train_steps:
                 break
 
-    # Create the pipeline using the trained modules and save it
+    # 保存最终模型
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         accelerator.unwrap_model(rdt).save_pretrained(args.output_dir)
         ema_save_path = os.path.join(args.output_dir, f"ema")
         accelerator.save_model(ema_rdt, ema_save_path)
 
-        logger.info(f"Saved Model to {args.output_dir}")
+        logger.info(f"💾 保存模型到 {args.output_dir}")
 
         if args.push_to_hub:
             save_model_card(
@@ -593,7 +616,7 @@ def train(args, logger):
             upload_folder(
                 repo_id=repo_id,
                 folder_path=args.output_dir,
-                commit_message="End of training",
+                commit_message="End of dual-teacher REPA training",
                 token=args.hub_token,
                 allow_patterns=["pytorch_model.bin", "*.json", "*.md"],
             )

@@ -70,6 +70,7 @@ def read_dirty_bit(chunk_dir):
 class VLAConsumerDataset(Dataset):
     """A vision-language-action Dataset for supervised training.
     This dataset will load data from the buffer directory.
+    🆕 支持双教师REPA的深度图像预处理
     """
 
     def __init__(
@@ -89,7 +90,8 @@ class VLAConsumerDataset(Dataset):
         state_noise_snr=None,
         use_hdf5=False,
         use_precomp_lang_embed=False,
-        use_dinov2_features=False,  # 🆕
+        use_dinov2_features=False,
+        use_depth_features=False,  # 🆕 新增深度特征支持
     ):
         super(VLAConsumerDataset, self).__init__()
 
@@ -125,9 +127,13 @@ class VLAConsumerDataset(Dataset):
         if use_precomp_lang_embed:
             self.empty_lang_embed = torch.load("data/empty_lang_embed.pt")
         
-        # 🆕 DINOv2相关配置
+        # DINOv2相关配置（现有）
         self.use_dinov2_features = use_dinov2_features
-        self.dinov2_image_size = 518  # DINOv2期望的输入尺寸
+        self.dinov2_image_size = 518
+        
+        # 🆕 DepthAnythingV2相关配置
+        self.use_depth_features = use_depth_features
+        self.depth_image_size = 518  # DepthAnythingV2期望的输入尺寸
 
         # Load dataset stat
         with open("configs/dataset_stat.json", "r") as f:
@@ -250,6 +256,9 @@ class VLAConsumerDataset(Dataset):
                     state_std = res["state_std"]
                     state_mean = res["state_mean"]
                     state_norm = res["state_norm"]
+                    
+                    # 🆕 获取qpos轨迹用于关键时间段分析
+                    qpos_trajectory = res.get("qpos_trajectory", None)
                 else:
                     (
                         content,
@@ -264,6 +273,7 @@ class VLAConsumerDataset(Dataset):
                         state_mean,
                         state_norm,
                     ) = self._safe_load(index)
+                    qpos_trajectory = None  # 非HDF5模式暂不支持
 
                 data_dict = {}
                 data_dict["dataset_name"] = content["dataset_name"]
@@ -285,6 +295,10 @@ class VLAConsumerDataset(Dataset):
                 data_dict["state_elem_mask"] = (state_elem_mask if random.random() > self.cond_mask_prob else
                                                 np.zeros_like(state_elem_mask))
                 data_dict["state_norm"] = state_norm
+
+                # 🆕 保存qpos轨迹
+                if qpos_trajectory is not None:
+                    data_dict["qpos_trajectory"] = qpos_trajectory
 
                 # Background image for padding/masking
                 background_color = np.array(
@@ -315,9 +329,8 @@ class VLAConsumerDataset(Dataset):
                         else:
                             rearranged_images.append((background_image.copy(), False))
 
-                # 🆕 为DINOv2准备单独的图像
+                # 🆕 为DINOv2准备单独的图像（现有代码保持不变）
                 if self.use_dinov2_features:
-                    # 明确使用第一个相机的最新帧
                     camera_idx = 0
                     frame_idx = self.img_history_size - 1
                     
@@ -330,21 +343,47 @@ class VLAConsumerDataset(Dataset):
                     if not valid or math.prod(image.shape) <= 0:
                         raise ValueError(f"DINOv2图像无效")
                     
-                    # 预处理
+                    # 预处理DINOv2图像
                     pil_image = Image.fromarray(image)
                     pil_image = pil_image.resize((self.dinov2_image_size, self.dinov2_image_size), Image.BILINEAR)
                     image_array = np.array(pil_image).astype(np.float32) / 255.0
                     image_tensor = torch.from_numpy(image_array).permute(2, 0, 1)
                     
-                    # 标准化
+                    # ImageNet标准化
                     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
                     std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
                     image_tensor = (image_tensor - mean) / std
                     
-                    # 添加batch维度并保存
-                    data_dict["dinov2_images"] = image_tensor.unsqueeze(0)  # (1, 3, H, W)
+                    data_dict["dinov2_images"] = image_tensor.unsqueeze(0)  # (1, 3, 518, 518)
 
-                # 处理原始图像
+                # 🆕 为DepthAnythingV2准备深度图像
+                if self.use_depth_features:
+                    camera_idx = 0  # 使用第一个相机
+                    frame_idx = self.img_history_size - 1  # 使用最新帧
+                    
+                    if camera_idx >= len(image_metas):
+                        raise ValueError(f"深度编码器相机索引 {camera_idx} 超出范围")
+                    
+                    images, image_mask = image_metas[camera_idx]
+                    image, valid = images[frame_idx], image_mask[frame_idx]
+                    
+                    if not valid or math.prod(image.shape) <= 0:
+                        raise ValueError(f"深度编码器图像无效")
+                    
+                    # DepthAnythingV2预处理：直接resize到518x518
+                    pil_image = Image.fromarray(image)
+                    pil_image = pil_image.resize((self.depth_image_size, self.depth_image_size), Image.BILINEAR)
+                    image_array = np.array(pil_image).astype(np.float32) / 255.0
+                    image_tensor = torch.from_numpy(image_array).permute(2, 0, 1)
+                    
+                    # ImageNet标准化（DepthAnythingV2使用相同的标准化）
+                    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                    image_tensor = (image_tensor - mean) / std
+                    
+                    data_dict["depth_images"] = image_tensor.unsqueeze(0)  # (1, 3, 518, 518)
+
+                # 处理原始图像（SigLIP编码用）
                 preprocessed_images = []
                 processor = self.image_processor
                 for image, valid in rearranged_images:
@@ -358,7 +397,7 @@ class VLAConsumerDataset(Dataset):
                         if average_brightness <= 0.15:
                             image = transforms.ColorJitter(brightness=(1.75, 1.75))(image)
 
-                    # Only apply image augmentation to 50% of the images
+                    # 图像增强
                     if valid and self.image_aug and (random.random() > 0.5):
                         aug_type = random.choice(["corrput_only", "color_only", "both"])
                         if aug_type != "corrput_only":
@@ -386,6 +425,7 @@ class VLAConsumerDataset(Dataset):
                     preprocessed_images.append(image)
                 data_dict["images"] = preprocessed_images
 
+                # 处理语言输入
                 if self.use_precomp_lang_embed:
                     if content["instruction"][-1] == ".":
                         content["instruction"] = content["instruction"][:-1]
@@ -404,6 +444,7 @@ class VLAConsumerDataset(Dataset):
                         len(data_dict["input_ids"]) <= self.tokenizer_max_length
                     ), f"Instruction length {len(data_dict['input_ids'])} exceeds the maximum length {self.tokenizer_max_length}."
 
+                # 转换numpy数组为tensor
                 for k, v in data_dict.items():
                     if isinstance(v, np.ndarray):
                         data_dict[k] = torch.from_numpy(v)
@@ -412,20 +453,20 @@ class VLAConsumerDataset(Dataset):
                     assert not isinstance(v, np.ndarray), f"key: {k}, value: {v}"
 
                 return data_dict
+                
             except BaseException as e:
                 if data_dict is not None:
-                    print(
-                        f"Error catched when processing sample from {data_dict.get('dataset_name')}:",
-                        e,
-                    )
+                    print(f"Error catched when processing sample from {data_dict.get('dataset_name')}: {e}")
                 else:
-                    print(f"Error catched when processing sample:", e)
+                    print(f"Error catched when processing sample: {e}")
                 traceback.print_exc()
                 index = (index + 1) % len(self)
 
 
 class DataCollatorForVLAConsumerDataset(object):
-    """Collate examples for supervised training."""
+    """Collate examples for supervised training.
+    🆕 支持双教师REPA的数据收集
+    """
 
     def __init__(self, tokenizer: transformers.PreTrainedTokenizer) -> None:
         self.tokenizer = tokenizer
@@ -441,21 +482,19 @@ class DataCollatorForVLAConsumerDataset(object):
             "ctrl_freqs": [],
         }
         
-        # 🆕 DINOv2图像
-        dinov2_images = []
+        # 视觉特征收集
+        dinov2_images = []      # DINOv2图像
+        depth_images = []       # 🆕 DepthAnythingV2图像
+        qpos_trajectories = []  # 🆕 qpos轨迹（用于关键时间段分析）
         
+        # 语言特征收集
         input_ids = []
         lang_embeds = []
         lang_embed_lens = []
 
         for instance in instances:
-            # Convert all the numpy arrays to tensor
-            keys_to_check = [
-                "states",
-                "actions",
-                "state_elem_mask",
-                "state_norm",
-            ]
+            # 收集基础数据
+            keys_to_check = ["states", "actions", "state_elem_mask", "state_norm"]
             for key in keys_to_check:
                 if isinstance(instance[key], torch.Tensor):
                     item = instance[key]
@@ -463,26 +502,38 @@ class DataCollatorForVLAConsumerDataset(object):
                     item = torch.from_numpy(instance[key])
                 batch[key].append(item)
 
+            # 收集语言数据
             if "input_ids" in instance:
                 input_ids.append(instance["input_ids"])
             else:
                 lang_embeds.append(instance["lang_embed"])
                 lang_embed_lens.append(instance["lang_embed"].shape[0])
 
+            # 收集图像和其他数据
             batch["images"].append(torch.stack(instance["images"], dim=0))
             batch["data_indices"].append(instance["data_idx"])
             batch["ctrl_freqs"].append(instance["ctrl_freq"])
             
-            # 🆕 收集DINOv2图像
+            # 🆕 收集DINOv2图像（现有）
             if "dinov2_images" in instance:
                 dinov2_images.append(instance["dinov2_images"])
+            
+            # 🆕 收集DepthAnythingV2图像
+            if "depth_images" in instance:
+                depth_images.append(instance["depth_images"])
+            
+            # 🆕 收集qpos轨迹
+            if "qpos_trajectory" in instance and instance["qpos_trajectory"] is not None:
+                qpos_trajectories.append(instance["qpos_trajectory"])
 
+        # 堆叠基础数据
         keys_to_stack = ["states", "actions", "state_elem_mask", "state_norm", "images"]
         for key in keys_to_stack:
             batch[key] = torch.stack(batch[key], dim=0)
 
         batch["ctrl_freqs"] = torch.tensor(batch["ctrl_freqs"])
 
+        # 处理语言数据
         if len(input_ids) > 0:
             input_ids = torch.nn.utils.rnn.pad_sequence(input_ids,
                                                         batch_first=True,
@@ -497,8 +548,26 @@ class DataCollatorForVLAConsumerDataset(object):
             batch["lang_embeds"] = lang_embeds
             batch["lang_attn_mask"] = input_lang_attn_mask
         
-        # 🆕 堆叠DINOv2图像
+        # 🆕 堆叠DINOv2图像（现有）
         if len(dinov2_images) > 0:
-            batch["dinov2_images"] = torch.stack(dinov2_images, dim=0)  
+            batch["dinov2_images"] = torch.stack(dinov2_images, dim=0)
+        
+        # 🆕 堆叠DepthAnythingV2图像
+        if len(depth_images) > 0:
+            batch["depth_images"] = torch.stack(depth_images, dim=0)
+        
+        # 🆕 堆叠qpos轨迹
+        if len(qpos_trajectories) > 0:
+            # 处理可能不同长度的轨迹，填充到统一长度
+            max_len = max(traj.shape[0] for traj in qpos_trajectories)
+            padded_trajectories = []
+            for traj in qpos_trajectories:
+                if traj.shape[0] < max_len:
+                    # 用最后一帧填充
+                    padding_len = max_len - traj.shape[0]
+                    padding = traj[-1:].repeat(padding_len, 1)
+                    traj = torch.cat([traj, padding], dim=0)
+                padded_trajectories.append(traj)
+            batch["qpos_trajectory"] = torch.stack(padded_trajectories, dim=0)
 
         return batch

@@ -14,6 +14,7 @@ class HDF5VLADataset:
     """
     This class is used to sample episodes from the embododiment dataset
     stored in HDF5.
+    🆕 支持返回qpos轨迹用于关键时间段分析
     """
 
     def __init__(self, model_config_path) -> None:
@@ -77,44 +78,7 @@ class HDF5VLADataset:
                 index = np.random.randint(0, len(self.file_paths))
 
     def parse_hdf5_file(self, file_path):
-        """[Modify] Parse a hdf5 file to generate a training sample at
-            a random timestep.
-
-        Args:
-            file_path (str): the path to the hdf5 file
-
-        Returns:
-            valid (bool): whether the episode is valid, which is useful for filtering.
-                If False, this episode will be dropped.
-            dict: a dictionary containing the training sample,
-                {
-                    "meta": {
-                        "dataset_name": str,    # the name of your dataset.
-                        "#steps": int,          # the number of steps in the episode,
-                                                # also the total timesteps.
-                        "instruction": str      # the language instruction for this episode.
-                    },
-                    "step_id": int,             # the index of the sampled step,
-                                                # also the timestep t.
-                    "state": ndarray,           # state[t], (1, STATE_DIM).
-                    "state_std": ndarray,       # std(state[:]), (STATE_DIM,).
-                    "state_mean": ndarray,      # mean(state[:]), (STATE_DIM,).
-                    "state_norm": ndarray,      # norm(state[:]), (STATE_DIM,).
-                    "actions": ndarray,         # action[t:t+CHUNK_SIZE], (CHUNK_SIZE, STATE_DIM).
-                    "state_indicator", ndarray, # indicates the validness of each dim, (STATE_DIM,).
-                    "cam_high": ndarray,        # external camera image, (IMG_HISORY_SIZE, H, W, 3)
-                                                # or (IMG_HISORY_SIZE, 0, 0, 0) if unavailable.
-                    "cam_high_mask": ndarray,   # indicates the validness of each timestep, (IMG_HISORY_SIZE,) boolean array.
-                                                # For the first IMAGE_HISTORY_SIZE-1 timesteps, the mask should be False.
-                    "cam_left_wrist": ndarray,  # left wrist camera image, (IMG_HISORY_SIZE, H, W, 3).
-                                                # or (IMG_HISORY_SIZE, 0, 0, 0) if unavailable.
-                    "cam_left_wrist_mask": ndarray,
-                    "cam_right_wrist": ndarray, # right wrist camera image, (IMG_HISORY_SIZE, H, W, 3).
-                                                # or (IMG_HISORY_SIZE, 0, 0, 0) if unavailable.
-                                                # If only one wrist, make it right wrist, plz.
-                    "cam_right_wrist_mask": ndarray
-                } or None if the episode is invalid.
-        """
+        """🔄 修改现有方法，添加qpos轨迹返回"""
         with h5py.File(file_path, "r") as f:
             qpos = f["observations"]["qpos"][:]
             left_arm_dim = f["observations"]["left_arm_dim"][:]
@@ -135,22 +99,14 @@ class HDF5VLADataset:
             else:
                 raise ValueError("Found no qpos that exceeds the threshold.")
 
+            # 🆕 保存完整的qpos轨迹用于关键时间段分析
+            qpos_trajectory = qpos.copy()
+
             # We randomly sample a timestep
             step_id = np.random.randint(first_idx - 1, num_steps)
 
             # Load the instruction
             dir_path = os.path.dirname(file_path)
-
-            # with open(os.path.join(dir_path, 'instruction.json'), 'r') as f_instr:
-            #     instruction_dict = json.load(f_instr)
-            # # We have 1/3 prob to use original instruction,
-            # # 1/3 to use simplified instruction,
-            # # and 1/3 to use expanded instruction.
-            # instruction_type = np.random.choice([
-            #     'instruction', 'expanded_instruction'])
-            # instruction = instruction_dict[instruction_type]
-            # if isinstance(instruction, list):
-            #    instruction = np.random.choice(instruction)
 
             # You can also use precomputed language embeddings (recommended)
             # instruction = "path/to/lang_embed.pt"
@@ -193,7 +149,6 @@ class HDF5VLADataset:
                 )
 
             # Fill the state/action into the unified vector
-
             def fill_in_state(values):
                 # Target indices corresponding to your state space
                 # In this example: 6 joints + 1 gripper for each arm
@@ -265,23 +220,11 @@ class HDF5VLADataset:
                 "cam_left_wrist_mask": cam_left_wrist_mask,
                 "cam_right_wrist": cam_right_wrist,
                 "cam_right_wrist_mask": cam_right_wrist_mask,
+                "qpos_trajectory": qpos_trajectory,  # 🆕 添加完整qpos轨迹
             }
 
     def parse_hdf5_file_state_only(self, file_path):
-        """[Modify] Parse a hdf5 file to generate a state trajectory.
-
-        Args:
-            file_path (str): the path to the hdf5 file
-
-        Returns:
-            valid (bool): whether the episode is valid, which is useful for filtering.
-                If False, this episode will be dropped.
-            dict: a dictionary containing the training sample,
-                {
-                    "state": ndarray,           # state[:], (T, STATE_DIM).
-                    "action": ndarray,          # action[:], (T, STATE_DIM).
-                } or None if the episode is invalid.
-        """
+        """🔄 修改现有方法，添加qpos轨迹返回"""
         with h5py.File(file_path, "r") as f:
             qpos = f["observations"]["qpos"][:]
             left_arm_dim = f["observations"]["left_arm_dim"][:]
@@ -301,6 +244,9 @@ class HDF5VLADataset:
                 first_idx = indices[0]
             else:
                 raise ValueError("Found no qpos that exceeds the threshold.")
+
+            # 🆕 保存完整的qpos轨迹
+            qpos_trajectory = qpos.copy()
 
             # Rescale gripper to [0, 1]
             qpos = qpos / np.array([[1 for i in range(left_arm_dim[0] + right_arm_dim[0] + 2)]])
@@ -327,7 +273,11 @@ class HDF5VLADataset:
             action = fill_in_state(action)
 
             # Return the resulting sample
-            return True, {"state": state, "action": action}
+            return True, {
+                "state": state, 
+                "action": action,
+                "qpos_trajectory": qpos_trajectory,  # 🆕 添加完整qpos轨迹
+            }
 
 
 if __name__ == "__main__":
