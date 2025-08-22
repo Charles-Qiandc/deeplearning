@@ -175,9 +175,10 @@ def train(args, logger):
     if use_depth_features and enable_repa_loss:
         logger.info("🔧 加载DepthAnythingV2编码器（深度几何教师）...")
         depth_encoder = create_depth_encoder(
-            model_size="vits",  # 使用小模型以节省显存
-            feature_dim=1024,   # 与DINOv2对齐
-            device=accelerator.device
+            model_size="metric_large",  # 使用Metric Large版本
+            feature_dim=1024,
+            device=accelerator.device,
+            use_metric_model=True  # 启用Metric版本
         )
         depth_encoder.to(accelerator.device, dtype=weight_dtype)
         depth_encoder.print_model_info()
@@ -494,8 +495,8 @@ def train(args, logger):
                 # 🆕 生成关键时间段标签
                 critical_labels = None
                 if "qpos_trajectory" in batch and batch["qpos_trajectory"] is not None:
-                    from data.critical_timestep_annotator import AgilexDualKeypointAnnotator
-                    annotator = AgilexDualKeypointAnnotator()
+                    from data.critical_timestep_annotator import create_silent_annotator
+                    annotator = create_silent_annotator()
                     
                     batch_critical_labels = []
                     for i in range(batch["qpos_trajectory"].shape[0]):
@@ -514,7 +515,7 @@ def train(args, logger):
                 # 🆕 计算双教师REPA损失
                 state_elem_mask = state_elem_mask.unsqueeze(1)
                 if enable_repa_loss:
-                    total_loss, diffusion_loss, repa_loss, routing_loss = accelerator.unwrap_model(rdt).compute_loss(
+                    total_loss, diffusion_loss, repa_loss, routing_loss, intermediate_activations = accelerator.unwrap_model(rdt).compute_loss(
                         lang_tokens=text_embeds,
                         lang_attn_mask=lang_attn_mask,
                         img_tokens=image_embeds,

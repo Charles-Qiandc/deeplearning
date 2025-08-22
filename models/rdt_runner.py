@@ -300,7 +300,7 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
                      self.repa_loss_weight * repa_loss + 
                      self.routing_loss_weight * routing_loss)
         
-        return total_loss, diffusion_loss, repa_loss, routing_loss
+        return total_loss, diffusion_loss, repa_loss, routing_loss, intermediate_activations
 
     # 推理相关方法保持不变
     def conditional_sample(self, lang_cond, lang_attn_mask, img_cond, state_traj, action_mask, ctrl_freqs):
@@ -376,5 +376,7 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
     
     def forward(self, *args, **kwargs) -> torch.Tensor:
         """保持兼容性，只返回总损失"""
-       total_loss, _, _, _ = self.compute_loss(*args, **kwargs)
-        return total_loss
+        result = self.compute_loss(*args, **kwargs)
+        if isinstance(result, tuple) and len(result) >= 1:
+            return result[0]  # 只返回total_loss
+        return result

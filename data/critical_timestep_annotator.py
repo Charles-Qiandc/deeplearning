@@ -110,7 +110,8 @@ class AgilexDualKeypointAnnotator:
                  min_interval_steps: int = 5,
                  max_interval_steps: int = 100,
                  keypoint_skip_steps: int = 10,              # 新增：检测到关键点后跳过的步数
-                 smooth: bool = True):
+                 smooth: bool = True,
+                 verbose: bool = False):                     # 🆕 新增：控制打印信息
         """
         Args:
             relative_low_speed_ratio: 相对低速比例，当前速度低于轨迹最大速度的这个比例时认为是低速（默认10%）
@@ -119,6 +120,7 @@ class AgilexDualKeypointAnnotator:
             max_interval_steps: 两个关键点之间的最大间隔步数
             keypoint_skip_steps: 检测到关键点后跳过的步数，避免连续关键点（默认10）
             smooth: 是否平滑速度曲线
+            verbose: 是否打印详细信息（默认False）
         """
         self.relative_low_speed_ratio = relative_low_speed_ratio
         self.min_deceleration_threshold = min_deceleration_threshold
@@ -126,6 +128,7 @@ class AgilexDualKeypointAnnotator:
         self.max_interval_steps = max_interval_steps
         self.keypoint_skip_steps = keypoint_skip_steps
         self.smooth = smooth
+        self.verbose = verbose  # 🆕 控制打印
         
         # 初始化正运动学计算器
         self.fk_calculator = AgilexForwardKinematics()
@@ -159,15 +162,6 @@ class AgilexDualKeypointAnnotator:
         """
         检测关键点：同时满足减速和低速条件的点
         新增跳过逻辑：检测到关键点后跳过指定步数，避免连续关键点
-        
-        Args:
-            velocity: 速度序列
-            acceleration: 加速度序列
-            low_speed_threshold: 低速阈值
-            arm_name: 臂名称（用于日志）
-            
-        Returns:
-            关键点索引列表
         """
         keypoints = []
         i = 0
@@ -179,12 +173,13 @@ class AgilexDualKeypointAnnotator:
             
             if is_low_speed and is_decelerating:
                 keypoints.append(i)
-                print(f"    🎯 {arm_name}臂关键点: 步骤 {i}, 速度={velocity[i]:.6f}, 加速度={acceleration[i]:.6f}")
+                if self.verbose:  # 🔧 只在verbose模式下打印
+                    print(f"    🎯 {arm_name}臂关键点: 步骤 {i}, 速度={velocity[i]:.6f}, 加速度={acceleration[i]:.6f}")
                 
                 # 跳过后续指定步数，避免连续关键点
                 skip_steps = self.keypoint_skip_steps
                 next_i = i + skip_steps + 1
-                if next_i < len(velocity):
+                if next_i < len(velocity) and self.verbose:
                     print(f"    ⏭️ {arm_name}臂跳过 {skip_steps} 步: 从步骤 {i+1} 跳到 {next_i}")
                 i = next_i
             else:
@@ -196,16 +191,10 @@ class AgilexDualKeypointAnnotator:
         """
         从关键点中找到有效的区间 - 使用配对逻辑
         第1个和第2个配对，第3个和第4个配对，以此类推
-        
-        Args:
-            keypoints: 关键点索引列表
-            arm_name: 臂名称（用于日志）
-            
-        Returns:
-            有效区间列表 [(start, end), ...]
         """
         if len(keypoints) < 2:
-            print(f"    ⚠️ {arm_name}臂关键点不足2个，无法形成区间")
+            if self.verbose:
+                print(f"    ⚠️ {arm_name}臂关键点不足2个，无法形成区间")
             return []
         
         intervals = []
@@ -219,14 +208,17 @@ class AgilexDualKeypointAnnotator:
             # 检查区间长度是否在合理范围内
             if self.min_interval_steps <= interval_length <= self.max_interval_steps:
                 intervals.append((start_point, end_point))
-                print(f"    ✅ {arm_name}臂有效区间: 关键点{i+1}-{i+2}, 步骤 {start_point}-{end_point} (长度{interval_length})")
+                if self.verbose:
+                    print(f"    ✅ {arm_name}臂有效区间: 关键点{i+1}-{i+2}, 步骤 {start_point}-{end_point} (长度{interval_length})")
             elif interval_length < self.min_interval_steps:
-                print(f"    ❌ {arm_name}臂区间太短: 关键点{i+1}-{i+2}, 步骤 {start_point}-{end_point} (长度{interval_length} < {self.min_interval_steps})")
+                if self.verbose:
+                    print(f"    ❌ {arm_name}臂区间太短: 关键点{i+1}-{i+2}, 步骤 {start_point}-{end_point} (长度{interval_length} < {self.min_interval_steps})")
             elif interval_length > self.max_interval_steps:
-                print(f"    ❌ {arm_name}臂区间太长: 关键点{i+1}-{i+2}, 步骤 {start_point}-{end_point} (长度{interval_length} > {self.max_interval_steps})")
+                if self.verbose:
+                    print(f"    ❌ {arm_name}臂区间太长: 关键点{i+1}-{i+2}, 步骤 {start_point}-{end_point} (长度{interval_length} > {self.max_interval_steps})")
         
         # 如果关键点数量是奇数，最后一个点无法配对
-        if len(keypoints) % 2 == 1:
+        if len(keypoints) % 2 == 1 and self.verbose:
             print(f"    ⚠️ {arm_name}臂最后一个关键点(第{len(keypoints)}个)无法配对，已忽略")
         
         return intervals
@@ -235,15 +227,9 @@ class AgilexDualKeypointAnnotator:
         """
         基于双关键点区间的关键时间段标注
         双臂联合检测：任一臂满足条件就标注，两臂都满足就都标注
-        
-        Args:
-            qpos_trajectory: (T, 14) 关节角度轨迹
-            
-        Returns:
-            critical_labels: (T,) 关键时间段标签，1表示关键，0表示非关键
-            analysis_info: 分析信息字典
         """
-        print("🎯 开始双关键点区间标注（双臂联合检测）")
+        if self.verbose:
+            print("🎯 开始双关键点区间标注（双臂联合检测）")
         
         # 1. 计算末端执行器位置
         left_ee_pos, right_ee_pos = self.fk_calculator.compute_end_effector_positions(qpos_trajectory)
@@ -260,17 +246,19 @@ class AgilexDualKeypointAnnotator:
         left_low_speed_threshold = left_max_velocity * self.relative_low_speed_ratio
         right_low_speed_threshold = right_max_velocity * self.relative_low_speed_ratio
         
-        print(f"速度统计:")
-        print(f"  左臂: 平均={np.mean(left_velocity):.6f}, 最大={left_max_velocity:.6f}")
-        print(f"  右臂: 平均={np.mean(right_velocity):.6f}, 最大={right_max_velocity:.6f}")
-        print(f"检测阈值:")
-        print(f"  左臂低速阈值: {left_low_speed_threshold:.6f} (最大速度的{self.relative_low_speed_ratio:.1%})")
-        print(f"  右臂低速阈值: {right_low_speed_threshold:.6f} (最大速度的{self.relative_low_speed_ratio:.1%})")
-        print(f"  减速阈值: {self.min_deceleration_threshold:.6f} (更宽松设置)")
-        print(f"  关键点跳过步数: {self.keypoint_skip_steps} (避免连续关键点)")
+        if self.verbose:
+            print(f"速度统计:")
+            print(f"  左臂: 平均={np.mean(left_velocity):.6f}, 最大={left_max_velocity:.6f}")
+            print(f"  右臂: 平均={np.mean(right_velocity):.6f}, 最大={right_max_velocity:.6f}")
+            print(f"检测阈值:")
+            print(f"  左臂低速阈值: {left_low_speed_threshold:.6f} (最大速度的{self.relative_low_speed_ratio:.1%})")
+            print(f"  右臂低速阈值: {right_low_speed_threshold:.6f} (最大速度的{self.relative_low_speed_ratio:.1%})")
+            print(f"  减速阈值: {self.min_deceleration_threshold:.6f} (更宽松设置)")
+            print(f"  关键点跳过步数: {self.keypoint_skip_steps} (避免连续关键点)")
         
         # 4. 检测关键点
-        print(f"\n🔍 检测关键点:")
+        if self.verbose:
+            print(f"\n🔍 检测关键点:")
         left_keypoints = self.detect_keypoints(
             left_velocity, left_acceleration, left_low_speed_threshold, "左"
         )
@@ -278,16 +266,19 @@ class AgilexDualKeypointAnnotator:
             right_velocity, right_acceleration, right_low_speed_threshold, "右"
         )
         
-        print(f"  左臂关键点: {len(left_keypoints)}个 - {left_keypoints}")
-        print(f"  右臂关键点: {len(right_keypoints)}个 - {right_keypoints}")
+        if self.verbose:
+            print(f"  左臂关键点: {len(left_keypoints)}个 - {left_keypoints}")
+            print(f"  右臂关键点: {len(right_keypoints)}个 - {right_keypoints}")
         
         # 5. 找到有效区间
-        print(f"\n📏 寻找有效区间:")
+        if self.verbose:
+            print(f"\n📏 寻找有效区间:")
         left_intervals = self.find_valid_intervals(left_keypoints, "左")
         right_intervals = self.find_valid_intervals(right_keypoints, "右")
         
         # 6. 双臂联合标记关键时间段
-        print(f"\n🤝 双臂联合标注:")
+        if self.verbose:
+            print(f"\n🤝 双臂联合标注:")
         T = len(left_velocity)
         critical_mask = np.zeros(T, dtype=bool)
         
@@ -295,26 +286,32 @@ class AgilexDualKeypointAnnotator:
         
         # 标记左臂区间
         if left_intervals:
-            print(f"  左臂贡献 {len(left_intervals)} 个区间:")
+            if self.verbose:
+                print(f"  左臂贡献 {len(left_intervals)} 个区间:")
             for start, end in left_intervals:
                 critical_mask[start:end+1] = True
                 all_intervals.append((start, end, 'left'))
-                print(f"    ✅ 左臂区间: 步骤 {start}-{end} (长度{end-start+1})")
+                if self.verbose:
+                    print(f"    ✅ 左臂区间: 步骤 {start}-{end} (长度{end-start+1})")
         else:
-            print(f"  左臂无有效区间")
+            if self.verbose:
+                print(f"  左臂无有效区间")
         
         # 标记右臂区间
         if right_intervals:
-            print(f"  右臂贡献 {len(right_intervals)} 个区间:")
+            if self.verbose:
+                print(f"  右臂贡献 {len(right_intervals)} 个区间:")
             for start, end in right_intervals:
                 critical_mask[start:end+1] = True
                 all_intervals.append((start, end, 'right'))
-                print(f"    ✅ 右臂区间: 步骤 {start}-{end} (长度{end-start+1})")
+                if self.verbose:
+                    print(f"    ✅ 右臂区间: 步骤 {start}-{end} (长度{end-start+1})")
         else:
-            print(f"  右臂无有效区间")
+            if self.verbose:
+                print(f"  右臂无有效区间")
         
         # 检查是否有重叠区间
-        if left_intervals and right_intervals:
+        if left_intervals and right_intervals and self.verbose:
             overlaps = []
             for l_start, l_end in left_intervals:
                 for r_start, r_end in right_intervals:
@@ -338,32 +335,33 @@ class AgilexDualKeypointAnnotator:
         # 9. 计算统计信息
         critical_count = np.sum(critical_labels)
         
-        print(f"\n📊 最终标注结果:")
-        print(f"  总步数: {T}")
-        print(f"  左臂关键点: {len(left_keypoints)}个")
-        print(f"  右臂关键点: {len(right_keypoints)}个")
-        print(f"  左臂有效区间: {len(left_intervals)}个")
-        print(f"  右臂有效区间: {len(right_intervals)}个")
-        print(f"  总标注区间: {len(all_intervals)}个")
-        print(f"  关键步数: {critical_count}")
-        print(f"  关键比例: {critical_count/T:.3f}")
-        print(f"  联合检测策略: 任一臂满足条件即标注 ✓")
-        
-        # 详细区间信息
-        if all_intervals:
-            print(f"  所有区间详情:")
-            for start, end, arm in sorted(all_intervals, key=lambda x: x[0]):
-                duration = end - start + 1
-                print(f"    {arm}臂: 步骤 {start}-{end} (持续{duration}步)")
-        else:
-            print("  ⚠️ 未检测到有效的关键区间")
-            print("  💡 当前使用宽松参数设置:")
-            print(f"    - 低速比例: {self.relative_low_speed_ratio:.1%} (10%)")
-            print(f"    - 减速阈值: {self.min_deceleration_threshold} (宽松)")
-            print("  💡 可进一步调整:")
-            print("    - 继续提高低速比例 (如15%)")
-            print("    - 进一步放宽减速阈值 (如-0.0003)")
-            print("    - 减小最小区间长度要求")
+        if self.verbose:
+            print(f"\n📊 最终标注结果:")
+            print(f"  总步数: {T}")
+            print(f"  左臂关键点: {len(left_keypoints)}个")
+            print(f"  右臂关键点: {len(right_keypoints)}个")
+            print(f"  左臂有效区间: {len(left_intervals)}个")
+            print(f"  右臂有效区间: {len(right_intervals)}个")
+            print(f"  总标注区间: {len(all_intervals)}个")
+            print(f"  关键步数: {critical_count}")
+            print(f"  关键比例: {critical_count/T:.3f}")
+            print(f"  联合检测策略: 任一臂满足条件即标注 ✓")
+            
+            # 详细区间信息
+            if all_intervals:
+                print(f"  所有区间详情:")
+                for start, end, arm in sorted(all_intervals, key=lambda x: x[0]):
+                    duration = end - start + 1
+                    print(f"    {arm}臂: 步骤 {start}-{end} (持续{duration}步)")
+            else:
+                print("  ⚠️ 未检测到有效的关键区间")
+                print("  💡 当前使用宽松参数设置:")
+                print(f"    - 低速比例: {self.relative_low_speed_ratio:.1%} (10%)")
+                print(f"    - 减速阈值: {self.min_deceleration_threshold} (宽松)")
+                print("  💡 可进一步调整:")
+                print("    - 继续提高低速比例 (如15%)")
+                print("    - 进一步放宽减速阈值 (如-0.0003)")
+                print("    - 减小最小区间长度要求")
         
         analysis_info = {
             'left_velocity': left_velocity,
@@ -406,6 +404,17 @@ class AgilexDualKeypointAnnotator:
         
         return critical_labels, analysis_info
 
+def create_silent_annotator():
+    """创建静默的关键时间段标注器（用于训练）"""
+    return AgilexDualKeypointAnnotator(
+        relative_low_speed_ratio=0.1,
+        min_deceleration_threshold=-0.0005,
+        min_interval_steps=5,
+        max_interval_steps=100,
+        keypoint_skip_steps=10,
+        smooth=True,
+        verbose=False  # 🔧 关闭所有打印信息
+    )
 
 def process_hdf5_file(file_path: str, 
                      relative_low_speed_ratio: float = 0.1,      # 10%

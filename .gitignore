@@ -8,3 +8,5 @@ wandb/*
 siglip-so400m-patch14-384/
 t5-v1_1-xxl/
 dinov2-large/
+*.pyc
+__pycache__/
