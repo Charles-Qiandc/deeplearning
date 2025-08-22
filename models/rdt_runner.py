@@ -14,25 +14,25 @@ from models.rdt.model import RDT
 class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin, 
                repo_url="https://huggingface.co/robotics-diffusion-transformer/rdt-1b"):
     """
-    🔄 集成双教师REPA对齐损失的RDT运行器
-    支持DINOv2（全局语义）和DepthAnythingV2（深度几何）的选择性对齐
+    集成双教师REPA对齐损失的RDT运行器
+    每个视觉教师有独立的投影器，将视觉特征投影到动作空间
     """
     def __init__(self, *, action_dim, pred_horizon, config, 
                  lang_token_dim, img_token_dim, state_token_dim, 
                  max_lang_cond_len, img_cond_len, lang_pos_embed_config=None, 
                  img_pos_embed_config=None, dtype=torch.bfloat16,
-                 # REPA相关参数（现有）
+                 # REPA相关参数
                  enable_repa_loss=True, repa_loss_weight=0.2,
-                 # 🆕 双教师相关参数
+                 # 双教师相关参数
                  use_dual_teachers=False, routing_loss_weight=0.1):
         super(RDTRunner, self).__init__()
         
-        # REPA损失配置（现有）
+        # REPA损失配置
         self.enable_repa_loss = enable_repa_loss
         self.repa_loss_weight = repa_loss_weight
         self.dtype = dtype
         
-        # 🆕 双教师配置
+        # 双教师配置
         self.use_dual_teachers = use_dual_teachers
         self.routing_loss_weight = routing_loss_weight
         
@@ -43,7 +43,7 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
         print(f"   - 路由损失权重: {routing_loss_weight}")
         print(f"   - 数据类型: {dtype}")
         
-        # 创建扩散模型（修改以支持双教师）
+        # 创建扩散模型
         hidden_size = config['rdt']['hidden_size']
         self.model = RDT(
             output_dim=action_dim,
@@ -57,10 +57,12 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
             img_pos_embed_config=img_pos_embed_config,
             dtype=dtype,
             enable_repa_loss=enable_repa_loss,
-            use_dual_teachers=use_dual_teachers,  # 🆕
+            use_dual_teachers=use_dual_teachers,
+            dinov2_feature_dim=1024,  # DINOv2特征维度
+            depth_feature_dim=1024,   # DepthAnythingV2特征维度
         )
 
-        # 现有的适配器创建保持不变
+        # 适配器创建
         self.lang_adaptor = self.build_condition_adapter(
             config['lang_adaptor'], 
             in_features=lang_token_dim, 
@@ -77,12 +79,12 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
             out_features=hidden_size
         )
         
-        # 转换适配器到正确的数据类型（现有）
+        # 转换适配器到正确的数据类型
         self.lang_adaptor = self.lang_adaptor.to(dtype)
         self.img_adaptor = self.img_adaptor.to(dtype)
         self.state_adaptor = self.state_adaptor.to(dtype)
         
-        # 现有的噪声调度器创建保持不变
+        # 噪声调度器创建
         noise_scheduler_config = config['noise_scheduler']
         self.noise_scheduler = DDPMScheduler(
             num_train_timesteps=noise_scheduler_config['num_train_timesteps'],
@@ -109,162 +111,98 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
             [p.numel() for p in self.img_adaptor.parameters()] + 
             [p.numel() for p in self.state_adaptor.parameters()]))
 
-    def compute_global_alignment_loss(self, action_tokens, cls_token):
+    def compute_dual_teacher_alignment_loss(self, action_tokens, dinov2_cls_token, depth_cls_token, 
+                                           routing_weights=None, critical_labels=None):
         """
-        计算与DINOv2全局特征的对齐损失
+        🔄 修改：使用独立投影器的双教师对齐
+        将视觉特征投影到动作空间，而不是相反
         
         Args:
-            action_tokens: (B, T, hidden_size) 动作tokens
-            cls_token: (B, 1, dinov2_dim) DINOv2 CLS token
+            action_tokens: (B, T, 2048) 动作tokens
+            dinov2_cls_token: (B, 1, 1024) DINOv2 CLS token
+            depth_cls_token: (B, 1024) Depth CLS token 
+            routing_weights: (B, T, 2) 路由权重 [全局专家权重, 深度专家权重]
+            critical_labels: (B, T) 关键时间段标签，仅用于监督路由网络
             
         Returns:
-            loss: 标量对齐损失
+            alignment_loss: 对齐损失
+            routing_loss: 路由监督损失
         """
         B, T, hidden_size = action_tokens.shape
+        device = action_tokens.device
+        dtype = action_tokens.dtype
         
-        # 时间平均得到整体动作表示
-        action_mean = action_tokens.mean(dim=1)  # (B, hidden_size)
+        # 🔄 关键修改：将视觉特征投影到动作空间
+        # 1. 投影DINOv2全局特征到动作空间
+        dinov2_cls_squeezed = dinov2_cls_token.squeeze(1)  # (B, 1024)
+        projected_dinov2 = self.model.dinov2_to_action_projector(dinov2_cls_squeezed)  # (B, 2048)
         
-        # 投影到视觉特征空间
-        projected_action = self.model.action_to_vision_projector(action_mean)  # (B, dinov2_dim)
-        
-        # 处理视觉特征
-        cls_token_squeezed = cls_token.squeeze(1)  # (B, dinov2_dim)
-        
-        # L2归一化
-        projected_action = F.normalize(projected_action, p=2, dim=-1)
-        cls_token_norm = F.normalize(cls_token_squeezed, p=2, dim=-1)
-        
-        # 计算余弦相似度
-        cosine_similarity = F.cosine_similarity(projected_action, cls_token_norm, dim=-1)
-        mean_similarity = cosine_similarity.mean()
-        
-        # 转换为损失（最大化相似度 = 最小化损失）
-        loss = 1.0 - mean_similarity
-        
-        return loss
-
-    def compute_selective_alignment_loss(self, action_tokens, cls_token, depth_features, critical_labels):
-        """
-        🆕 根据关键时间段选择性计算对齐损失
-        
-        Args:
-            action_tokens: (B, T, hidden_size) 动作tokens
-            cls_token: (B, 1, dinov2_dim) DINOv2 CLS token (全局语义特征)
-            depth_features: (B, N_patches, depth_dim) 深度特征，其中第0个是CLS token
-            critical_labels: (B, T) 关键时间段标签 (0=非关键, 1=关键)
-            
-        Returns:
-            loss: 标量对齐损失
-        """
-        if critical_labels is None:
-            # 如果没有标签，回退到全局对齐
-            return self.compute_global_alignment_loss(action_tokens, cls_token)
-        
-        B, T, hidden_size = action_tokens.shape
-        total_loss = torch.tensor(0.0, device=action_tokens.device, dtype=action_tokens.dtype)
-        
-        # 投影所有动作tokens到视觉特征空间
-        projected_actions = self.model.action_to_vision_projector(
-            action_tokens.reshape(B * T, hidden_size)
-        ).reshape(B, T, -1)  # (B, T, 1024)
-        
-        # 🆕 提取深度CLS token
-        if depth_features.shape[1] == 1370:  # 包含CLS token
-            depth_cls_token = depth_features[:, 0, :]  # (B, depth_dim) - 第0个token是CLS
+        # 2. 投影Depth特征到动作空间
+        if depth_cls_token.dim() == 3:
+            depth_cls_squeezed = depth_cls_token.squeeze(1)  # (B, 1024)
         else:
-            # 如果没有CLS token，报错或回退
-            raise ValueError("深度特征中没有找到CLS token，请检查DepthAnythingV2的输出格式")
+            depth_cls_squeezed = depth_cls_token  # Already (B, 1024)
+        projected_depth = self.model.depth_to_action_projector(depth_cls_squeezed)  # (B, 2048)
         
-        # 准备目标特征
-        # 全局语义特征：DINOv2 CLS token
-        global_cls_token = cls_token.squeeze(1)  # (B, dinov2_dim)
-        global_targets = global_cls_token.unsqueeze(1).expand(-1, T, -1)  # (B, T, dinov2_dim)
+        # 3. 扩展投影后的视觉特征到时间维度
+        projected_dinov2_expanded = projected_dinov2.unsqueeze(1).expand(-1, T, -1)  # (B, T, 2048)
+        projected_depth_expanded = projected_depth.unsqueeze(1).expand(-1, T, -1)  # (B, T, 2048)
         
-        # 深度几何特征：DepthAnythingV2 CLS token
-        depth_targets = depth_cls_token.unsqueeze(1).expand(-1, T, -1)  # (B, T, depth_dim)
+        # 4. 归一化用于余弦相似度计算
+        action_tokens_norm = F.normalize(action_tokens, p=2, dim=-1)  # (B, T, 2048)
+        dinov2_norm = F.normalize(projected_dinov2_expanded, p=2, dim=-1)  # (B, T, 2048)
+        depth_norm = F.normalize(projected_depth_expanded, p=2, dim=-1)  # (B, T, 2048)
         
-        # 分别处理关键和非关键时间段
-        critical_mask = critical_labels.bool()  # (B, T)
-        non_critical_mask = ~critical_mask      # (B, T)
+        # 5. 计算余弦相似度
+        global_similarity = torch.sum(action_tokens_norm * dinov2_norm, dim=-1)  # (B, T)
+        depth_similarity = torch.sum(action_tokens_norm * depth_norm, dim=-1)  # (B, T)
         
-        valid_loss_computed = False
+        # 6. 转换为损失（1 - similarity）
+        global_losses = 1.0 - global_similarity  # (B, T)
+        depth_losses = 1.0 - depth_similarity  # (B, T)
         
-        # 处理非关键时间段：动作token与DINOv2 CLS token对齐
-        if non_critical_mask.any():
-            # 获取非关键时间段的tokens和目标
-            non_critical_actions = projected_actions[non_critical_mask]  # (N_non_critical, 1024)
-            non_critical_targets = global_targets[non_critical_mask]     # (N_non_critical, 1024)
+        # 7. 使用路由权重进行软组合
+        if routing_weights is not None:
+            # routing_weights: (B, T, 2) - [全局权重, 深度权重]
+            weighted_losses = (routing_weights[:, :, 0] * global_losses + 
+                             routing_weights[:, :, 1] * depth_losses)  # (B, T)
+            alignment_loss = weighted_losses.mean()
             
-            if non_critical_actions.numel() > 0:
-                # L2归一化
-                non_critical_actions_norm = F.normalize(non_critical_actions, p=2, dim=-1)
-                non_critical_targets_norm = F.normalize(non_critical_targets, p=2, dim=-1)
-                
-                # 余弦相似度
-                non_critical_similarity = F.cosine_similarity(
-                    non_critical_actions_norm, non_critical_targets_norm, dim=-1
-                )
-                non_critical_loss = 1.0 - non_critical_similarity.mean()
-                total_loss = total_loss + non_critical_loss
-                valid_loss_computed = True
+            # 额外记录：每个专家的平均损失（用于监控）
+            global_expert_loss = (routing_weights[:, :, 0] * global_losses).sum() / (routing_weights[:, :, 0].sum() + 1e-6)
+            depth_expert_loss = (routing_weights[:, :, 1] * depth_losses).sum() / (routing_weights[:, :, 1].sum() + 1e-6)
+        else:
+            # 如果没有路由权重，使用均等权重
+            alignment_loss = 0.5 * (global_losses.mean() + depth_losses.mean())
+            global_expert_loss = global_losses.mean()
+            depth_expert_loss = depth_losses.mean()
         
-        # 处理关键时间段：动作token与DepthAnythingV2 CLS token对齐
-        if critical_mask.any():
-            # 获取关键时间段的tokens和目标
-            critical_actions = projected_actions[critical_mask]  # (N_critical, 1024)
-            critical_targets = depth_targets[critical_mask]      # (N_critical, 1024)
+        # 8. 计算路由监督损失（如果有标签）
+        routing_loss = torch.tensor(0.0, device=device, dtype=dtype)
+        if routing_weights is not None and critical_labels is not None:
+            # 将标签转换为目标路由权重
+            target_routing = torch.zeros_like(routing_weights)
+            target_routing[:, :, 0] = 1 - critical_labels.float()  # 全局专家权重
+            target_routing[:, :, 1] = critical_labels.float()      # 深度专家权重
             
-            if critical_actions.numel() > 0:
-                # L2归一化
-                critical_actions_norm = F.normalize(critical_actions, p=2, dim=-1)
-                critical_targets_norm = F.normalize(critical_targets, p=2, dim=-1)
-                
-                # 余弦相似度
-                critical_similarity = F.cosine_similarity(
-                    critical_actions_norm, critical_targets_norm, dim=-1
-                )
-                critical_loss = 1.0 - critical_similarity.mean()
-                total_loss = total_loss + critical_loss
-                valid_loss_computed = True
+            # 交叉熵损失
+            routing_loss = F.binary_cross_entropy(routing_weights, target_routing, reduction='mean')
         
-        # 如果没有计算任何有效损失，返回零损失
-        if not valid_loss_computed:
-            total_loss = torch.tensor(0.0, device=action_tokens.device, dtype=action_tokens.dtype)
+        # 返回详细的损失信息
+        loss_dict = {
+            'alignment_loss': alignment_loss,
+            'routing_loss': routing_loss,
+            'global_expert_loss': global_expert_loss.detach(),
+            'depth_expert_loss': depth_expert_loss.detach(),
+        }
         
-        return total_loss
-
-    def compute_routing_loss(self, routing_weights, critical_labels):
-        """
-        🆕 计算路由监督损失
-        
-        Args:
-            routing_weights: (B, T, 2) 路由权重 [全局专家, 深度专家]
-            critical_labels: (B, T) 关键时间段标签 (0=非关键, 1=关键)
-            
-        Returns:
-            loss: 标量路由损失
-        """
-        if critical_labels is None:
-            return torch.tensor(0.0, device=routing_weights.device, dtype=routing_weights.dtype)
-        
-        # 将关键标签转换为one-hot格式
-        # 0 -> [1, 0] (使用全局专家)
-        # 1 -> [0, 1] (使用深度专家)
-        target_weights = torch.zeros_like(routing_weights)
-        target_weights[:, :, 0] = 1 - critical_labels.float()  # 全局专家权重
-        target_weights[:, :, 1] = critical_labels.float()      # 深度专家权重
-        
-        # 交叉熵损失
-        loss = F.binary_cross_entropy(routing_weights, target_weights, reduction='mean')
-        
-        return loss
+        return alignment_loss, routing_loss, loss_dict
 
     def compute_loss(self, lang_tokens, lang_attn_mask, img_tokens, 
                      state_tokens, action_gt, action_mask, ctrl_freqs,
                      cls_token=None, depth_features=None, critical_labels=None):
         """
-        🔄 修改：计算总损失，包括扩散损失、REPA对齐损失和路由损失
+        计算总损失，包括扩散损失和双教师对齐损失
         
         Returns:
             tuple: (total_loss, diffusion_loss, repa_loss, routing_loss)
@@ -272,14 +210,14 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
         batch_size = lang_tokens.shape[0]
         device = lang_tokens.device
 
-        # 确保所有输入都转换为正确的数据类型（现有代码保持不变）
+        # 确保所有输入都转换为正确的数据类型
         lang_tokens = lang_tokens.to(self.dtype)
         img_tokens = img_tokens.to(self.dtype)
         state_tokens = state_tokens.to(self.dtype)
         action_gt = action_gt.to(self.dtype)
         action_mask = action_mask.to(self.dtype)
         
-        # 原有的扩散损失计算逻辑（现有代码保持不变）
+        # 扩散损失计算
         noise = torch.randn(action_gt.shape, dtype=action_gt.dtype, device=device)
         timesteps = torch.randint(0, self.num_train_timesteps, (batch_size,), device=device).long()
         noisy_action = self.noise_scheduler.add_noise(action_gt, noise, timesteps)
@@ -291,13 +229,13 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
         lang_cond, img_cond, state_action_traj = self.adapt_conditions(
             lang_tokens, img_tokens, state_action_traj)
         
-        # 获取模型预测和中间激活（现有代码保持不变）
+        # 获取模型预测和中间激活
         pred, intermediate_activations = self.model(
             state_action_traj, ctrl_freqs, timesteps, lang_cond, img_cond, 
             lang_mask=lang_attn_mask
         )
 
-        # 计算扩散损失（现有代码保持不变）
+        # 计算扩散损失
         pred_type = self.prediction_type 
         if pred_type == 'epsilon':
             target = noise
@@ -308,7 +246,7 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
 
         diffusion_loss = F.mse_loss(pred, target)
         
-        # 🔄 修改：计算双教师REPA对齐损失和路由损失
+        # 计算双教师REPA对齐损失
         repa_loss = torch.tensor(0.0, device=device, dtype=diffusion_loss.dtype)
         routing_loss = torch.tensor(0.0, device=device, dtype=diffusion_loss.dtype)
         
@@ -316,26 +254,46 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
             action_tokens = intermediate_activations['action_tokens_for_repa']
             
             if self.use_dual_teachers:
-                # 🆕 双教师模式：根据关键时间段选择CLS token对齐
+                # 双教师模式：使用独立投影器
                 if cls_token is not None and depth_features is not None:
                     cls_token = cls_token.to(self.dtype)
                     depth_features = depth_features.to(self.dtype)
                     
-                    # 使用深度CLS token的选择性对齐
-                    repa_loss = self.compute_selective_alignment_loss(
-                        action_tokens, cls_token, depth_features, critical_labels
-                    )
-                
-                # 计算路由监督损失（如果有路由权重）
-                if 'routing_weights' in intermediate_activations and critical_labels is not None:
-                    routing_weights = intermediate_activations['routing_weights']
-                    routing_loss = self.compute_routing_loss(routing_weights, critical_labels)
+                    # 提取深度CLS token
+                    if depth_features.shape[1] >= 1:
+                        depth_cls_token = depth_features[:, 0, :]  # (B, 1024)
+                    else:
+                        depth_cls_token = cls_token.squeeze(1)  # Fallback
                     
+                    # 获取路由权重
+                    routing_weights = intermediate_activations.get('routing_weights', None)
+                    
+                    # 计算双教师对齐损失
+                    repa_loss, routing_loss, loss_dict = self.compute_dual_teacher_alignment_loss(
+                        action_tokens, 
+                        cls_token,       # DINOv2 CLS token
+                        depth_cls_token, # Depth CLS token
+                        routing_weights,
+                        critical_labels
+                    )
             else:
-                # 保持原有的单教师模式
+                # 单教师模式（向后兼容，但也改为投影视觉到动作空间）
                 if cls_token is not None:
                     cls_token = cls_token.to(self.dtype)
-                    repa_loss = self.compute_global_alignment_loss(action_tokens, cls_token)
+                    # 简化版：直接计算平均动作token与投影后视觉特征的对齐
+                    action_mean = action_tokens.mean(dim=1)  # (B, 2048)
+                    cls_squeezed = cls_token.squeeze(1)  # (B, 1024)
+                    
+                    # 使用DINOv2投影器
+                    projected_cls = self.model.dinov2_to_action_projector(cls_squeezed)  # (B, 2048)
+                    
+                    # 归一化
+                    action_norm = F.normalize(action_mean, p=2, dim=-1)
+                    cls_norm = F.normalize(projected_cls, p=2, dim=-1)
+                    
+                    # 余弦相似度
+                    similarity = F.cosine_similarity(action_norm, cls_norm, dim=-1)
+                    repa_loss = 1.0 - similarity.mean()
         
         # 总损失
         total_loss = (diffusion_loss + 
@@ -344,10 +302,9 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
         
         return total_loss, diffusion_loss, repa_loss, routing_loss
 
-    # 现有的其他方法保持不变
-    def conditional_sample(self, lang_cond, lang_attn_mask, img_cond, 
-                           state_traj, action_mask, ctrl_freqs):
-        """现有代码保持不变"""
+    # 推理相关方法保持不变
+    def conditional_sample(self, lang_cond, lang_attn_mask, img_cond, state_traj, action_mask, ctrl_freqs):
+        """推理时的条件采样，不涉及对齐机制"""
         device = state_traj.device
         dtype = state_traj.dtype
         noisy_action = torch.randn(
@@ -362,6 +319,7 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
             action_traj = self.state_adaptor(action_traj)
             state_action_traj = torch.cat([state_traj, action_traj], dim=1)
             
+            # 推理时不返回中间激活，只要预测结果
             model_output, _ = self.model(state_action_traj, ctrl_freqs,
                                         t.unsqueeze(-1).to(device),
                                         lang_cond, img_cond, lang_mask=lang_attn_mask)
@@ -372,14 +330,13 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
         
         noisy_action = noisy_action * action_mask
         return noisy_action
-    
     def build_condition_adapter(self, projector_type, in_features, out_features):
-        """现有代码保持不变"""
+        """构建条件适配器"""
         projector = None
         if projector_type == 'linear':
             projector = nn.Linear(in_features, out_features)
         else:
-            mlp_gelu_match = re.match(r'^mlp(\d+)x_gelu, projector_type)
+            mlp_gelu_match = re.match(r'^mlp(\d+)x_gelu', projector_type)
             if mlp_gelu_match:
                 mlp_depth = int(mlp_gelu_match.group(1))
                 modules = [nn.Linear(in_features, out_features)]
@@ -392,15 +349,15 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
         return projector
     
     def adapt_conditions(self, lang_tokens, img_tokens, state_tokens):
-        """现有代码保持不变"""
+        """适配条件输入"""
         adapted_lang = self.lang_adaptor(lang_tokens)
         adapted_img = self.img_adaptor(img_tokens)
         adapted_state = self.state_adaptor(state_tokens)
         return adapted_lang, adapted_img, adapted_state
 
     def predict_action(self, lang_tokens, lang_attn_mask, img_tokens, state_tokens,
-                       action_mask, ctrl_freqs, vision_features=None):
-        """现有代码保持不变"""
+                        action_mask, ctrl_freqs, vision_features=None):
+        """预测动作，推理时不需要视觉对齐特征"""
         lang_tokens = lang_tokens.to(self.dtype)
         img_tokens = img_tokens.to(self.dtype)
         state_tokens = state_tokens.to(self.dtype)
@@ -418,6 +375,6 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
         return action_pred
     
     def forward(self, *args, **kwargs) -> torch.Tensor:
-        """🔄 修改：保持兼容性，只返回总损失"""
-        total_loss, _, _, _ = self.compute_loss(*args, **kwargs)
+        """保持兼容性，只返回总损失"""
+       total_loss, _, _, _ = self.compute_loss(*args, **kwargs)
         return total_loss

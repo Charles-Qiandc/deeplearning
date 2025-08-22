@@ -689,7 +689,79 @@ def quick_test():
     print(f"      - 避免连续的关键点造成过短区间")
     print(f"      - 提高关键点间距，增加有效区间的概率")
 
-
+def visualize_critical_detection(file_path: str, save_path: str = "critical_analysis.png"):
+    """
+    可视化关键时间段检测结果
+    
+    Args:
+        file_path: HDF5文件路径
+        save_path: 保存图像路径
+    """
+    import matplotlib.pyplot as plt
+    
+    # 创建标注器
+    annotator = AgilexDualKeypointAnnotator()
+    
+    # 读取数据
+    with h5py.File(file_path, 'r') as f:
+        qpos = f['observations']['qpos'][:]
+    
+    # 执行标注
+    critical_labels, analysis_info = annotator.annotate(qpos)
+    
+    # 提取分析数据
+    left_velocity = analysis_info['left_velocity']
+    right_velocity = analysis_info['right_velocity']
+    left_keypoints = analysis_info['left_keypoints']
+    right_keypoints = analysis_info['right_keypoints']
+    
+    # 创建图形
+    fig, axes = plt.subplots(3, 1, figsize=(12, 8))
+    time_steps = range(len(left_velocity))
+    
+    # 图1：左臂速度和关键点
+    ax1 = axes[0]
+    ax1.plot(time_steps, left_velocity, 'b-', label='Left Arm Velocity')
+    for kp in left_keypoints:
+        ax1.axvline(x=kp, color='r', linestyle='--', alpha=0.5)
+    ax1.set_ylabel('Velocity (m/s)')
+    ax1.set_title('Left Arm Analysis')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # 图2：右臂速度和关键点
+    ax2 = axes[1]
+    ax2.plot(time_steps, right_velocity, 'g-', label='Right Arm Velocity')
+    for kp in right_keypoints:
+        ax2.axvline(x=kp, color='r', linestyle='--', alpha=0.5)
+    ax2.set_ylabel('Velocity (m/s)')
+    ax2.set_title('Right Arm Analysis')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    # 图3：关键时间段标签
+    ax3 = axes[2]
+    ax3.fill_between(time_steps, 0, critical_labels, alpha=0.5, color='orange')
+    ax3.set_ylabel('Critical (0/1)')
+    ax3.set_xlabel('Time Step')
+    ax3.set_title('Critical Timesteps (1=Critical, 0=Non-critical)')
+    ax3.set_ylim(-0.1, 1.1)
+    ax3.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"✅ 可视化结果保存到: {save_path}")
+    
+    # 打印统计信息
+    critical_ratio = np.mean(critical_labels)
+    print(f"\n📊 关键时间段统计:")
+    print(f"  - 总步数: {len(critical_labels)}")
+    print(f"  - 关键步数: {np.sum(critical_labels)}")
+    print(f"  - 关键比例: {critical_ratio:.2%}")
+    print(f"  - 左臂关键点数: {len(left_keypoints)}")
+    print(f"  - 右臂关键点数: {len(right_keypoints)}")
+    
+    return critical_labels, analysis_info
 if __name__ == "__main__":
     import sys
     

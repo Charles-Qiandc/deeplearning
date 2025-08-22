@@ -522,9 +522,9 @@ def train(args, logger):
                         action_gt=actions,
                         action_mask=state_elem_mask,
                         ctrl_freqs=ctrl_freqs,
-                        cls_token=cls_token,              # DINOv2 CLS token
-                        depth_features=depth_features,   # DepthAnythingV2特征（包含CLS）
-                        critical_labels=critical_labels, # 关键时间段标签
+                        cls_token=cls_token,              
+                        depth_features=depth_features,   
+                        critical_labels=critical_labels,
                     )
                     loss = total_loss
                     
@@ -538,6 +538,13 @@ def train(args, logger):
                         critical_ratio = critical_labels.float().mean().item()
                         loss_for_log["critical_ratio"] = critical_ratio
                         
+                        # 记录每个专家的使用率
+                        if 'routing_weights' in intermediate_activations:
+                            routing_weights = intermediate_activations['routing_weights']
+                            global_usage = routing_weights[:, :, 0].mean().item()
+                            depth_usage = routing_weights[:, :, 1].mean().item()
+                            loss_for_log["global_expert_usage"] = global_usage
+                            loss_for_log["depth_expert_usage"] = depth_usage
                 else:
                     # 原始方式
                     loss = rdt(
