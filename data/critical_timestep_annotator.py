@@ -2,9 +2,16 @@ import os
 import numpy as np
 import h5py
 import fnmatch
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Optional
 from scipy.signal import savgol_filter
 from scipy.ndimage import binary_dilation
+from enum import IntEnum
+
+
+class TaskType(IntEnum):
+    """任务类型枚举"""
+    GRASP = 1  # 抓取类任务
+    CLICK = 2  # 点击类任务
 
 
 class AgilexForwardKinematics:
@@ -97,41 +104,51 @@ class AgilexForwardKinematics:
         return left_ee_positions, right_ee_positions
 
 
-class AgilexDualKeypointAnnotator:
+class TaskDrivenCriticalTimestepAnnotator:
     """
-    Agilex机器人双关键点区间标注器
-    检测两个关键点（减速+低速），然后将两点之间的所有动作标记为关键时间段
-    双臂联合检测：任一臂满足条件就标注，两臂都满足就都标注
+    任务驱动的关键时间段标注器
+    
+    🎯 核心创新：
+    1. 基于任务类型的不同标注逻辑
+    2. 夹爪状态作为关键时间节点
+    3. 双臂独立标注但联合输出
+    
+    标注策略：
+    - 抓取类：减速对准 → 夹爪闭合（关键时间段）
+    - 点击类：夹爪闭合 → 减速对准（关键时间段）
     """
     
     def __init__(self, 
-                 relative_low_speed_ratio: float = 0.1,      # 10%
-                 min_deceleration_threshold: float = -0.0005, # 更宽松
-                 min_interval_steps: int = 5,
-                 max_interval_steps: int = 100,
-                 keypoint_skip_steps: int = 10,              # 新增：检测到关键点后跳过的步数
+                 task_type: TaskType = TaskType.GRASP,
+                 relative_low_speed_ratio: float = 0.15,
+                 min_deceleration_threshold: float = -0.0008,
+                 gripper_close_delta_threshold: float = 0.01,  # 🔧 夹爪闭合变化阈值
                  smooth: bool = True,
-                 verbose: bool = False):                     # 🆕 新增：控制打印信息
+                 verbose: bool = False):
         """
+        初始化任务驱动的关键时间段标注器
+        
         Args:
-            relative_low_speed_ratio: 相对低速比例，当前速度低于轨迹最大速度的这个比例时认为是低速（默认10%）
-            min_deceleration_threshold: 最小减速度阈值，加速度小于此值认为是减速（默认-0.0005，更宽松）
-            min_interval_steps: 两个关键点之间的最小间隔步数
-            max_interval_steps: 两个关键点之间的最大间隔步数
-            keypoint_skip_steps: 检测到关键点后跳过的步数，避免连续关键点（默认10）
+            task_type: 任务类型（GRASP=1, CLICK=2）
+            relative_low_speed_ratio: 相对低速比例（默认15%）
+            min_deceleration_threshold: 最小减速度阈值（默认-0.0008）
+            gripper_close_delta_threshold: 夹爪闭合变化阈值（默认0.01，检测夹爪开始闭合）
             smooth: 是否平滑速度曲线
-            verbose: 是否打印详细信息（默认False）
+            verbose: 是否打印详细信息
         """
+        self.task_type = task_type
         self.relative_low_speed_ratio = relative_low_speed_ratio
         self.min_deceleration_threshold = min_deceleration_threshold
-        self.min_interval_steps = min_interval_steps
-        self.max_interval_steps = max_interval_steps
-        self.keypoint_skip_steps = keypoint_skip_steps
+        self.gripper_close_delta_threshold = gripper_close_delta_threshold
         self.smooth = smooth
-        self.verbose = verbose  # 🆕 控制打印
+        self.verbose = verbose
         
         # 初始化正运动学计算器
         self.fk_calculator = AgilexForwardKinematics()
+        
+        # 任务类型验证
+        if task_type not in [TaskType.GRASP, TaskType.CLICK]:
+            raise ValueError(f"不支持的任务类型: {task_type}")
         
     def compute_velocity(self, trajectory: np.ndarray) -> np.ndarray:
         """计算轨迹速度（欧氏范数）"""
@@ -157,292 +174,337 @@ class AgilexDualKeypointAnnotator:
         acceleration = np.diff(velocity, prepend=velocity[0])
         return acceleration
     
-    def detect_keypoints(self, velocity: np.ndarray, acceleration: np.ndarray, 
-                        low_speed_threshold: float, arm_name: str) -> List[int]:
+    def detect_gripper_events(self, gripper_trajectory: np.ndarray, arm_name: str) -> List[int]:
         """
-        检测关键点：同时满足减速和低速条件的点
-        新增跳过逻辑：检测到关键点后跳过指定步数，避免连续关键点
-        """
-        keypoints = []
-        i = 0
+        检测夹爪开始闭合事件（基于变化量，不是绝对值）
         
-        while i < len(velocity):
-            # 检查是否同时满足减速和低速条件
-            is_low_speed = velocity[i] < low_speed_threshold
-            is_decelerating = acceleration[i] < self.min_deceleration_threshold
+        Args:
+            gripper_trajectory: (T,) 夹爪开度轨迹
+            arm_name: 机械臂名称（用于日志）
+            
+        Returns:
+            gripper_close_points: 夹爪开始闭合的时间点列表
+        """
+        gripper_close_points = []
+        
+        # 计算夹爪开度的变化率（负值表示闭合）
+        gripper_delta = np.diff(gripper_trajectory, prepend=gripper_trajectory[0])
+        
+        # 检测夹爪开始显著闭合的时间点
+        for t in range(1, len(gripper_delta)):
+            # 夹爪闭合：当前变化为负且变化量超过阈值
+            if gripper_delta[t] < -self.gripper_close_delta_threshold:
+                gripper_close_points.append(t)
+                if self.verbose:
+                    print(f"    🤏 {arm_name}臂夹爪开始闭合: 步骤 {t}, 开度={gripper_trajectory[t]:.4f}, 变化量={gripper_delta[t]:.4f}")
+        
+        # 🔧 去重：如果连续多个时间点都检测到闭合，只保留第一个
+        if len(gripper_close_points) > 1:
+            filtered_points = [gripper_close_points[0]]
+            for point in gripper_close_points[1:]:
+                if point - filtered_points[-1] > 5:  # 至少间隔5步
+                    filtered_points.append(point)
+            gripper_close_points = filtered_points
+            
+            if self.verbose and len(filtered_points) < len(gripper_close_points):
+                print(f"    🔄 {arm_name}臂去重后夹爪闭合点: {filtered_points}")
+        
+        return gripper_close_points
+    
+    def detect_deceleration_low_speed_points(self, velocity: np.ndarray, 
+                                           acceleration: np.ndarray,
+                                           low_speed_threshold: float, 
+                                           arm_name: str) -> List[int]:
+        """
+        检测减速且低速的时间点
+        
+        Args:
+            velocity: 速度轨迹
+            acceleration: 加速度轨迹
+            low_speed_threshold: 低速阈值
+            arm_name: 机械臂名称
+            
+        Returns:
+            decel_low_speed_points: 减速且低速的时间点列表
+        """
+        decel_low_speed_points = []
+        
+        for t in range(len(velocity)):
+            is_low_speed = velocity[t] < low_speed_threshold
+            is_decelerating = acceleration[t] < self.min_deceleration_threshold
             
             if is_low_speed and is_decelerating:
-                keypoints.append(i)
-                if self.verbose:  # 🔧 只在verbose模式下打印
-                    print(f"    🎯 {arm_name}臂关键点: 步骤 {i}, 速度={velocity[i]:.6f}, 加速度={acceleration[i]:.6f}")
-                
-                # 跳过后续指定步数，避免连续关键点
-                skip_steps = self.keypoint_skip_steps
-                next_i = i + skip_steps + 1
-                if next_i < len(velocity) and self.verbose:
-                    print(f"    ⏭️ {arm_name}臂跳过 {skip_steps} 步: 从步骤 {i+1} 跳到 {next_i}")
-                i = next_i
-            else:
-                i += 1
+                decel_low_speed_points.append(t)
+                if self.verbose:
+                    print(f"    🎯 {arm_name}臂减速低速点: 步骤 {t}, 速度={velocity[t]:.6f}, 加速度={acceleration[t]:.6f}")
         
-        return keypoints
+        return decel_low_speed_points
     
-    def find_valid_intervals(self, keypoints: List[int], arm_name: str) -> List[Tuple[int, int]]:
+    def find_critical_segment_grasp_mode(self, gripper_points: List[int], 
+                                       decel_points: List[int],
+                                       arm_name: str) -> Optional[Tuple[int, int]]:
         """
-        从关键点中找到有效的区间 - 使用配对逻辑
-        第1个和第2个配对，第3个和第4个配对，以此类推
-        """
-        if len(keypoints) < 2:
-            if self.verbose:
-                print(f"    ⚠️ {arm_name}臂关键点不足2个，无法形成区间")
-            return []
+        抓取模式：简化检测流程
+        🔧 1. 找到第一个减速点
+        🔧 2. 在减速点之后找到第一个夹爪闭合点
+        🔧 3. 两点之间即为关键时间段
         
-        intervals = []
-        
-        # 配对逻辑：(0,1), (2,3), (4,5), ...
-        for i in range(0, len(keypoints) - 1, 2):
-            start_point = keypoints[i]
-            end_point = keypoints[i + 1]
-            interval_length = end_point - start_point
+        Args:
+            gripper_points: 夹爪闭合时间点
+            decel_points: 减速低速时间点
+            arm_name: 机械臂名称
             
-            # 检查区间长度是否在合理范围内
-            if self.min_interval_steps <= interval_length <= self.max_interval_steps:
-                intervals.append((start_point, end_point))
-                if self.verbose:
-                    print(f"    ✅ {arm_name}臂有效区间: 关键点{i+1}-{i+2}, 步骤 {start_point}-{end_point} (长度{interval_length})")
-            elif interval_length < self.min_interval_steps:
-                if self.verbose:
-                    print(f"    ❌ {arm_name}臂区间太短: 关键点{i+1}-{i+2}, 步骤 {start_point}-{end_point} (长度{interval_length} < {self.min_interval_steps})")
-            elif interval_length > self.max_interval_steps:
-                if self.verbose:
-                    print(f"    ❌ {arm_name}臂区间太长: 关键点{i+1}-{i+2}, 步骤 {start_point}-{end_point} (长度{interval_length} > {self.max_interval_steps})")
+        Returns:
+            critical_segment: (start, end) 或 None
+        """
+        if not gripper_points or not decel_points:
+            if self.verbose:
+                print(f"    ❌ {arm_name}臂抓取模式：缺少关键点（夹爪点:{len(gripper_points)}, 减速点:{len(decel_points)}）")
+            return None
         
-        # 如果关键点数量是奇数，最后一个点无法配对
-        if len(keypoints) % 2 == 1 and self.verbose:
-            print(f"    ⚠️ {arm_name}臂最后一个关键点(第{len(keypoints)}个)无法配对，已忽略")
+        # 🔧 步骤1：找到第一个减速点
+        first_decel_point = min(decel_points)
+        if self.verbose:
+            print(f"    🎯 {arm_name}臂第一个减速点: 步骤 {first_decel_point}")
         
-        return intervals
+        # 🔧 步骤2：在减速点之后找到第一个夹爪闭合点
+        following_gripper_points = [gp for gp in gripper_points if gp > first_decel_point]
+        
+        if not following_gripper_points:
+            if self.verbose:
+                print(f"    ❌ {arm_name}臂：减速点({first_decel_point})之后无夹爪闭合点")
+            return None
+        
+        first_gripper_point = min(following_gripper_points)
+        if self.verbose:
+            print(f"    🤏 {arm_name}臂减速后第一个夹爪闭合点: 步骤 {first_gripper_point}")
+        
+        # 🔧 步骤3：两点之间即为关键时间段
+        start_point = first_decel_point
+        end_point = first_gripper_point
+        
+        if self.verbose:
+            print(f"    ✅ {arm_name}臂抓取关键段: 步骤 {start_point}-{end_point} (长度{end_point-start_point+1})")
+        
+        return (start_point, end_point)
+    
+    def find_critical_segment_click_mode(self, gripper_points: List[int], 
+                                       decel_points: List[int],
+                                       arm_name: str) -> Optional[Tuple[int, int]]:
+        """
+        点击模式：简化检测流程
+        🔧 1. 找到第一个夹爪闭合点
+        🔧 2. 在夹爪闭合点之后找到第一个减速点
+        🔧 3. 两点之间即为关键时间段
+        
+        Args:
+            gripper_points: 夹爪闭合时间点
+            decel_points: 减速低速时间点
+            arm_name: 机械臂名称
+            
+        Returns:
+            critical_segment: (start, end) 或 None
+        """
+        if not gripper_points or not decel_points:
+            if self.verbose:
+                print(f"    ❌ {arm_name}臂点击模式：缺少关键点（夹爪点:{len(gripper_points)}, 减速点:{len(decel_points)}）")
+            return None
+        
+        # 🔧 步骤1：找到第一个夹爪闭合点
+        first_gripper_point = min(gripper_points)
+        if self.verbose:
+            print(f"    🤏 {arm_name}臂第一个夹爪闭合点: 步骤 {first_gripper_point}")
+        
+        # 🔧 步骤2：在夹爪闭合点之后找到第一个减速点
+        following_decel_points = [dp for dp in decel_points if dp > first_gripper_point]
+        
+        if not following_decel_points:
+            if self.verbose:
+                print(f"    ❌ {arm_name}臂：夹爪闭合点({first_gripper_point})之后无减速点")
+            return None
+        
+        first_decel_point = min(following_decel_points)
+        if self.verbose:
+            print(f"    🎯 {arm_name}臂夹爪闭合后第一个减速点: 步骤 {first_decel_point}")
+        
+        # 🔧 步骤3：两点之间即为关键时间段
+        start_point = first_gripper_point
+        end_point = first_decel_point
+        
+        if self.verbose:
+            print(f"    ✅ {arm_name}臂点击关键段: 步骤 {start_point}-{end_point} (长度{end_point-start_point+1})")
+        
+        return (start_point, end_point)
+    
+    def annotate_single_arm(self, ee_positions: np.ndarray, 
+                          gripper_trajectory: np.ndarray,
+                          arm_name: str) -> Optional[Tuple[int, int]]:
+        """
+        单臂关键时间段标注
+        
+        Args:
+            ee_positions: (T, 3) 末端执行器位置轨迹
+            gripper_trajectory: (T,) 夹爪开度轨迹
+            arm_name: 机械臂名称（'左' 或 '右'）
+            
+        Returns:
+            critical_segment: (start, end) 或 None
+        """
+        if self.verbose:
+            print(f"  🔍 标注{arm_name}臂（任务类型: {'抓取' if self.task_type == TaskType.GRASP else '点击'}）")
+        
+        # 1. 计算运动学特征
+        velocity = self.compute_velocity(ee_positions)
+        acceleration = self.compute_acceleration(velocity)
+        
+        # 2. 计算阈值
+        max_velocity = np.max(velocity)
+        low_speed_threshold = max_velocity * self.relative_low_speed_ratio
+        
+        if self.verbose:
+            print(f"    速度统计: 平均={np.mean(velocity):.6f}, 最大={max_velocity:.6f}")
+            print(f"    低速阈值: {low_speed_threshold:.6f} (最大速度的{self.relative_low_speed_ratio:.1%})")
+        
+        # 3. 检测关键事件点
+        gripper_points = self.detect_gripper_events(gripper_trajectory, arm_name)
+        decel_points = self.detect_deceleration_low_speed_points(
+            velocity, acceleration, low_speed_threshold, arm_name)
+        
+        # 4. 根据任务类型找到关键时间段
+        if self.task_type == TaskType.GRASP:
+            critical_segment = self.find_critical_segment_grasp_mode(
+                gripper_points, decel_points, arm_name)
+        else:  # TaskType.CLICK
+            critical_segment = self.find_critical_segment_click_mode(
+                gripper_points, decel_points, arm_name)
+        
+        return critical_segment
     
     def annotate(self, qpos_trajectory: np.ndarray) -> Tuple[np.ndarray, Dict]:
         """
-        基于双关键点区间的关键时间段标注
-        双臂联合检测：任一臂满足条件就标注，两臂都满足就都标注
+        主标注函数：基于任务类型的智能关键时间段标注
+        
+        Args:
+            qpos_trajectory: (T, 14) 关节角度轨迹
+            
+        Returns:
+            critical_labels: (T,) 关键时间段标签 (0/1)
+            analysis_info: 分析信息字典
         """
+        task_name = "抓取类" if self.task_type == TaskType.GRASP else "点击类"
+        
         if self.verbose:
-            print("🎯 开始双关键点区间标注（双臂联合检测）")
+            print(f"🎯 开始任务驱动标注（{task_name}）")
+            print("=" * 50)
         
         # 1. 计算末端执行器位置
         left_ee_pos, right_ee_pos = self.fk_calculator.compute_end_effector_positions(qpos_trajectory)
         
-        # 2. 计算速度和加速度
-        left_velocity = self.compute_velocity(left_ee_pos)
-        right_velocity = self.compute_velocity(right_ee_pos)
-        left_acceleration = self.compute_acceleration(left_velocity)
-        right_acceleration = self.compute_acceleration(right_velocity)
+        # 2. 提取夹爪轨迹
+        left_gripper = qpos_trajectory[:, 6]   # 左臂夹爪（第7列）
+        right_gripper = qpos_trajectory[:, 13]  # 右臂夹爪（第14列）
         
-        # 3. 计算低速阈值
-        left_max_velocity = np.max(left_velocity)
-        right_max_velocity = np.max(right_velocity)
-        left_low_speed_threshold = left_max_velocity * self.relative_low_speed_ratio
-        right_low_speed_threshold = right_max_velocity * self.relative_low_speed_ratio
+        # 3. 双臂独立标注
+        left_segment = self.annotate_single_arm(left_ee_pos, left_gripper, "左")
+        right_segment = self.annotate_single_arm(right_ee_pos, right_gripper, "右")
         
-        if self.verbose:
-            print(f"速度统计:")
-            print(f"  左臂: 平均={np.mean(left_velocity):.6f}, 最大={left_max_velocity:.6f}")
-            print(f"  右臂: 平均={np.mean(right_velocity):.6f}, 最大={right_max_velocity:.6f}")
-            print(f"检测阈值:")
-            print(f"  左臂低速阈值: {left_low_speed_threshold:.6f} (最大速度的{self.relative_low_speed_ratio:.1%})")
-            print(f"  右臂低速阈值: {right_low_speed_threshold:.6f} (最大速度的{self.relative_low_speed_ratio:.1%})")
-            print(f"  减速阈值: {self.min_deceleration_threshold:.6f} (更宽松设置)")
-            print(f"  关键点跳过步数: {self.keypoint_skip_steps} (避免连续关键点)")
-        
-        # 4. 检测关键点
-        if self.verbose:
-            print(f"\n🔍 检测关键点:")
-        left_keypoints = self.detect_keypoints(
-            left_velocity, left_acceleration, left_low_speed_threshold, "左"
-        )
-        right_keypoints = self.detect_keypoints(
-            right_velocity, right_acceleration, right_low_speed_threshold, "右"
-        )
-        
-        if self.verbose:
-            print(f"  左臂关键点: {len(left_keypoints)}个 - {left_keypoints}")
-            print(f"  右臂关键点: {len(right_keypoints)}个 - {right_keypoints}")
-        
-        # 5. 找到有效区间
-        if self.verbose:
-            print(f"\n📏 寻找有效区间:")
-        left_intervals = self.find_valid_intervals(left_keypoints, "左")
-        right_intervals = self.find_valid_intervals(right_keypoints, "右")
-        
-        # 6. 双臂联合标记关键时间段
-        if self.verbose:
-            print(f"\n🤝 双臂联合标注:")
-        T = len(left_velocity)
+        # 4. 生成标注标签
+        T = len(qpos_trajectory)
         critical_mask = np.zeros(T, dtype=bool)
         
-        all_intervals = []
+        segments = []
         
-        # 标记左臂区间
-        if left_intervals:
+        # 左臂时间段
+        if left_segment is not None:
+            start, end = left_segment
+            critical_mask[start:end+1] = True
+            segments.append((start, end, 'left'))
             if self.verbose:
-                print(f"  左臂贡献 {len(left_intervals)} 个区间:")
-            for start, end in left_intervals:
-                critical_mask[start:end+1] = True
-                all_intervals.append((start, end, 'left'))
-                if self.verbose:
-                    print(f"    ✅ 左臂区间: 步骤 {start}-{end} (长度{end-start+1})")
-        else:
+                print(f"  ✅ 左臂关键时间段: 步骤 {start}-{end} (长度{end-start+1})")
+        
+        # 右臂时间段
+        if right_segment is not None:
+            start, end = right_segment
+            critical_mask[start:end+1] = True
+            segments.append((start, end, 'right'))
             if self.verbose:
-                print(f"  左臂无有效区间")
+                print(f"  ✅ 右臂关键时间段: 步骤 {start}-{end} (长度{end-start+1})")
         
-        # 标记右臂区间
-        if right_intervals:
-            if self.verbose:
-                print(f"  右臂贡献 {len(right_intervals)} 个区间:")
-            for start, end in right_intervals:
-                critical_mask[start:end+1] = True
-                all_intervals.append((start, end, 'right'))
-                if self.verbose:
-                    print(f"    ✅ 右臂区间: 步骤 {start}-{end} (长度{end-start+1})")
-        else:
-            if self.verbose:
-                print(f"  右臂无有效区间")
-        
-        # 检查是否有重叠区间
-        if left_intervals and right_intervals and self.verbose:
-            overlaps = []
-            for l_start, l_end in left_intervals:
-                for r_start, r_end in right_intervals:
-                    # 检查区间重叠
-                    overlap_start = max(l_start, r_start)
-                    overlap_end = min(l_end, r_end)
-                    if overlap_start <= overlap_end:
-                        overlaps.append((overlap_start, overlap_end))
-            
-            if overlaps:
-                print(f"  🔗 发现双臂重叠区间 {len(overlaps)} 个:")
-                for start, end in overlaps:
-                    print(f"    双臂重叠: 步骤 {start}-{end} (长度{end-start+1})")
-        
-        # 7. 结束点总是关键的
-        critical_mask[-1] = True
-        
-        # 8. 转换为0/1标签
+        # 5. 转换为标签
         critical_labels = critical_mask.astype(int)
-        
-        # 9. 计算统计信息
         critical_count = np.sum(critical_labels)
         
-        if self.verbose:
-            print(f"\n📊 最终标注结果:")
-            print(f"  总步数: {T}")
-            print(f"  左臂关键点: {len(left_keypoints)}个")
-            print(f"  右臂关键点: {len(right_keypoints)}个")
-            print(f"  左臂有效区间: {len(left_intervals)}个")
-            print(f"  右臂有效区间: {len(right_intervals)}个")
-            print(f"  总标注区间: {len(all_intervals)}个")
-            print(f"  关键步数: {critical_count}")
-            print(f"  关键比例: {critical_count/T:.3f}")
-            print(f"  联合检测策略: 任一臂满足条件即标注 ✓")
-            
-            # 详细区间信息
-            if all_intervals:
-                print(f"  所有区间详情:")
-                for start, end, arm in sorted(all_intervals, key=lambda x: x[0]):
-                    duration = end - start + 1
-                    print(f"    {arm}臂: 步骤 {start}-{end} (持续{duration}步)")
-            else:
-                print("  ⚠️ 未检测到有效的关键区间")
-                print("  💡 当前使用宽松参数设置:")
-                print(f"    - 低速比例: {self.relative_low_speed_ratio:.1%} (10%)")
-                print(f"    - 减速阈值: {self.min_deceleration_threshold} (宽松)")
-                print("  💡 可进一步调整:")
-                print("    - 继续提高低速比例 (如15%)")
-                print("    - 进一步放宽减速阈值 (如-0.0003)")
-                print("    - 减小最小区间长度要求")
-        
+        # 6. 生成分析信息
         analysis_info = {
-            'left_velocity': left_velocity,
-            'right_velocity': right_velocity,
-            'left_acceleration': left_acceleration,
-            'right_acceleration': right_acceleration,
+            'task_type': self.task_type,
+            'task_name': task_name,
+            'left_segment': left_segment,
+            'right_segment': right_segment,
+            'all_segments': segments,
             'left_ee_positions': left_ee_pos,
             'right_ee_positions': right_ee_pos,
-            'left_keypoints': left_keypoints,
-            'right_keypoints': right_keypoints,
-            'left_intervals': left_intervals,
-            'right_intervals': right_intervals,
-            'all_intervals': all_intervals,
-            'velocity_thresholds': {
-                'left_low_speed_threshold': left_low_speed_threshold,
-                'right_low_speed_threshold': right_low_speed_threshold,
-                'left_max_velocity': left_max_velocity,
-                'right_max_velocity': right_max_velocity,
-                'min_deceleration_threshold': self.min_deceleration_threshold,
-            },
+            'left_gripper': left_gripper,
+            'right_gripper': right_gripper,
             'statistics': {
                 'total_steps': T,
                 'critical_steps': int(critical_count),
                 'critical_ratio': float(critical_count / T),
-                'left_keypoints_count': len(left_keypoints),
-                'right_keypoints_count': len(right_keypoints),
-                'left_intervals_count': len(left_intervals),
-                'right_intervals_count': len(right_intervals),
-                'total_intervals_count': len(all_intervals),
-                'joint_detection': True,  # 标记使用了联合检测
+                'left_has_segment': left_segment is not None,
+                'right_has_segment': right_segment is not None,
+                'total_segments': len(segments),
                 'config': {
+                    'task_type': int(self.task_type),
                     'relative_low_speed_ratio': self.relative_low_speed_ratio,
                     'min_deceleration_threshold': self.min_deceleration_threshold,
-                    'min_interval_steps': self.min_interval_steps,
-                    'max_interval_steps': self.max_interval_steps,
-                    'keypoint_skip_steps': self.keypoint_skip_steps,
+                    'gripper_close_delta_threshold': self.gripper_close_delta_threshold,
                 }
             }
         }
+        }
+        
+        if self.verbose:
+            print(f"\n📊 标注结果:")
+            print(f"  任务类型: {task_name}")
+            print(f"  总步数: {T}")
+            print(f"  关键步数: {critical_count}")
+            print(f"  关键比例: {critical_count/T:.3f}")
+            print(f"  左臂段: {'有' if left_segment else '无'}")
+            print(f"  右臂段: {'有' if right_segment else '无'}")
+            print(f"  总时间段数: {len(segments)}")
+            
+            if segments:
+                print(f"  详细段落:")
+                for start, end, arm in segments:
+                    duration = end - start + 1
+                    print(f"    {arm}臂: 步骤 {start}-{end} (持续{duration}步)")
         
         return critical_labels, analysis_info
 
-def create_silent_annotator():
-    """创建静默的关键时间段标注器（用于训练）"""
-    return AgilexDualKeypointAnnotator(
-        relative_low_speed_ratio=0.1,
-        min_deceleration_threshold=-0.0005,
-        min_interval_steps=5,
-        max_interval_steps=100,
-        keypoint_skip_steps=10,
+
+def create_task_annotator(task_type: TaskType, verbose: bool = False):
+    """创建任务驱动标注器的工厂函数"""
+    return TaskDrivenCriticalTimestepAnnotator(
+        task_type=task_type,
+        relative_low_speed_ratio=0.15,
+        min_deceleration_threshold=-0.0008,
+        gripper_close_delta_threshold=0.01,  # 🔧 夹爪闭合变化阈值
         smooth=True,
-        verbose=False  # 🔧 关闭所有打印信息
+        verbose=verbose
     )
 
-def process_hdf5_file(file_path: str, 
-                     relative_low_speed_ratio: float = 0.1,      # 10%
-                     min_deceleration_threshold: float = -0.0005, # 更宽松
-                     min_interval_steps: int = 5,
-                     max_interval_steps: int = 100,
-                     keypoint_skip_steps: int = 10) -> Dict:      # 新增参数
+
+def process_hdf5_file_with_task(file_path: str, task_type: TaskType) -> Dict:
     """
-    处理单个HDF5文件 - 使用双关键点区间方法（双臂联合检测）
+    使用任务驱动标注器处理HDF5文件
     
     Args:
         file_path: HDF5文件路径
-        relative_low_speed_ratio: 相对低速比例（默认10%）
-        min_deceleration_threshold: 最小减速度阈值（默认-0.0005，更宽松）
-        min_interval_steps: 最小区间长度
-        max_interval_steps: 最大区间长度
-        keypoint_skip_steps: 关键点跳过步数（默认10）
+        task_type: 任务类型（GRASP=1, CLICK=2）
         
     Returns:
-        结果字典，包含critical_labels和分析信息
+        结果字典
     """
-    annotator = AgilexDualKeypointAnnotator(
-        relative_low_speed_ratio=relative_low_speed_ratio,
-        min_deceleration_threshold=min_deceleration_threshold,
-        min_interval_steps=min_interval_steps,
-        max_interval_steps=max_interval_steps,
-        keypoint_skip_steps=keypoint_skip_steps
-    )
+    annotator = create_task_annotator(task_type, verbose=True)
     
     try:
         with h5py.File(file_path, 'r') as f:
@@ -470,6 +532,7 @@ def process_hdf5_file(file_path: str,
             
             return {
                 'file_path': file_path,
+                'task_type': task_type,
                 'critical_labels': critical_labels,
                 'analysis_info': analysis_info,
                 'success': True
@@ -478,130 +541,16 @@ def process_hdf5_file(file_path: str,
     except Exception as e:
         return {
             'file_path': file_path,
+            'task_type': task_type,
             'error': str(e),
             'success': False
         }
 
 
-def batch_process_dataset(data_dir: str = None, 
-                         relative_low_speed_ratio: float = 0.1,        # 10%
-                         min_deceleration_threshold: float = -0.0005,  # 更宽松
-                         min_interval_steps: int = 5,
-                         max_interval_steps: int = 100,
-                         keypoint_skip_steps: int = 10,                # 新增参数
-                         max_files: int = 10) -> Dict:
-    """
-    批量处理数据集 - 使用双关键点区间方法（双臂联合检测）
-    """
-    # 如果没有指定数据目录，自动搜索
-    if data_dir is None:
-        possible_dirs = [
-            "processed_data/click_bell",
-            "../processed_data/click_bell", 
-            "../../processed_data/click_bell",
-            "processed_data",
-            "../processed_data",
-            "../../processed_data",
-        ]
-        
-        for d in possible_dirs:
-            if os.path.exists(d):
-                data_dir = d
-                print(f"🔍 自动找到数据目录: {data_dir}")
-                break
-        
-        if data_dir is None:
-            print("❌ 未找到数据目录，请手动指定 --data_dir")
-            return {'results': [], 'successful_count': 0, 'total_count': 0}
-    
-    # 查找HDF5文件
-    hdf5_files = []
-    for root, dirs, files in os.walk(data_dir):
-        for filename in fnmatch.filter(files, "*.hdf5"):
-            hdf5_files.append(os.path.join(root, filename))
-            if len(hdf5_files) >= max_files:
-                break
-        if len(hdf5_files) >= max_files:
-            break
-    
-    print(f"找到 {len(hdf5_files)} 个HDF5文件，处理前 {max_files} 个")
-    print(f"使用双关键点区间方法（双臂联合检测）")
-    print(f"参数设置: 低速比例={relative_low_speed_ratio:.1%}, 减速阈值={min_deceleration_threshold}, 跳过步数={keypoint_skip_steps}")
-    
-    results = []
-    for i, file_path in enumerate(hdf5_files[:max_files]):
-        print(f"\n处理 {i+1}/{max_files}: {os.path.basename(file_path)}")
-        print("-" * 50)
-        
-        result = process_hdf5_file(
-            file_path, 
-            relative_low_speed_ratio,
-            min_deceleration_threshold,
-            min_interval_steps,
-            max_interval_steps,
-            keypoint_skip_steps
-        )
-        results.append(result)
-        
-        if result['success']:
-            stats = result['analysis_info']['statistics']
-            left_kp = stats['left_keypoints_count']
-            right_kp = stats['right_keypoints_count']
-            total_intervals = stats['total_intervals_count']
-            critical_ratio = stats['critical_ratio']
-            print(f"✅ 成功 - 左臂点数:{left_kp}, 右臂点数:{right_kp}, 区间数:{total_intervals}, 关键比例:{critical_ratio:.3f}")
-        else:
-            print(f"❌ 失败: {result['error']}")
-    
-    # 计算总体统计
-    successful_results = [r for r in results if r['success']]
-    if successful_results:
-        critical_ratios = [r['analysis_info']['statistics']['critical_ratio'] 
-                          for r in successful_results]
-        left_keypoints_counts = [r['analysis_info']['statistics']['left_keypoints_count']
-                               for r in successful_results]
-        right_keypoints_counts = [r['analysis_info']['statistics']['right_keypoints_count']
-                                for r in successful_results]
-        interval_counts = [r['analysis_info']['statistics']['total_intervals_count']
-                          for r in successful_results]
-        
-        avg_ratio = np.mean(critical_ratios)
-        avg_left_kp = np.mean(left_keypoints_counts)
-        avg_right_kp = np.mean(right_keypoints_counts)
-        avg_intervals = np.mean(interval_counts)
-        
-        print(f"\n📊 总体统计:")
-        print(f"  成功处理: {len(successful_results)}/{len(results)}")
-        print(f"  平均关键比例: {avg_ratio:.3f}")
-        print(f"  平均左臂关键点: {avg_left_kp:.1f}")
-        print(f"  平均右臂关键点: {avg_right_kp:.1f}")
-        print(f"  平均区间数: {avg_intervals:.1f}")
-        print(f"  🤝 使用双臂联合检测策略:")
-        print(f"    低速比例: {relative_low_speed_ratio:.1%}")
-        print(f"    减速阈值: {min_deceleration_threshold}")
-        print(f"    区间长度: {min_interval_steps}-{max_interval_steps}")
-        print(f"    跳过步数: {keypoint_skip_steps} (避免连续关键点)")
-    
-    return {
-        'results': results,
-        'successful_count': len(successful_results),
-        'total_count': len(results),
-        'config': {
-            'relative_low_speed_ratio': relative_low_speed_ratio,
-            'min_deceleration_threshold': min_deceleration_threshold,
-            'min_interval_steps': min_interval_steps,
-            'max_interval_steps': max_interval_steps,
-            'keypoint_skip_steps': keypoint_skip_steps,
-            'data_dir': data_dir,
-            'method': 'dual_keypoint_joint_detection_with_skip'
-        }
-    }
-
-
-def quick_test():
-    """快速测试双关键点区间方法（双臂联合检测）"""
-    print("🧪 Agilex双关键点区间标注器测试（双臂联合检测）")
-    print("=" * 80)
+def test_task_annotators():
+    """测试不同任务类型的标注器"""
+    print("🧪 任务驱动关键时间段标注器测试")
+    print("=" * 60)
     
     # 查找测试文件
     test_files = []
@@ -620,209 +569,103 @@ def quick_test():
                         full_path = os.path.join(root, file)
                         test_files.append(full_path)
                         print(f"  找到: {full_path}")
-                        if len(test_files) >= 1:
+                        if len(test_files) >= 2:  # 只需要2个测试文件
                             break
-                if len(test_files) >= 1:
+                if len(test_files) >= 2:
                     break
-        if len(test_files) >= 1:
+        if len(test_files) >= 2:
             break
     
     if not test_files:
         print("❌ 未找到HDF5测试文件")
         return
     
-    print(f"\n📁 使用测试文件: {test_files[0]}")
-    
-    # 测试不同参数配置
+    # 测试两种任务类型
     test_configs = [
-        {
-            'relative_low_speed_ratio': 0.1,      # 10%，当前默认值
-            'min_deceleration_threshold': -0.0005, # 宽松加速度阈值
-            'min_interval_steps': 5,
-            'max_interval_steps': 50,
-            'keypoint_skip_steps': 10              # 跳过10步
-        },
-        {
-            'relative_low_speed_ratio': 0.08,     # 8%，稍微严格
-            'min_deceleration_threshold': -0.0003, # 更宽松的加速度阈值
-            'min_interval_steps': 3,
-            'max_interval_steps': 80,
-            'keypoint_skip_steps': 8               # 跳过8步
-        },
-        {
-            'relative_low_speed_ratio': 0.15,     # 15%，更宽松
-            'min_deceleration_threshold': -0.0008, # 中等宽松
-            'min_interval_steps': 10,
-            'max_interval_steps': 100,
-            'keypoint_skip_steps': 15              # 跳过15步
-        }
+        (TaskType.GRASP, "抓取类任务"),
+        (TaskType.CLICK, "点击类任务")
     ]
     
-    print(f"\n🎯 双关键点区间方法测试结果 (双臂联合检测 + 跳过逻辑):")
-    print("低速比例 | 减速阈值 | 跳过步数 | 左臂点数 | 右臂点数 | 总区间数 | 关键比例")
-    print("-" * 75)
+    print(f"\n🎯 任务驱动标注测试结果:")
+    print("任务类型 | 文件 | 左臂段 | 右臂段 | 总段数 | 关键比例 | 状态")
+    print("-" * 80)
     
-    for i, config in enumerate(test_configs):
-        result = process_hdf5_file(test_files[0], **config)
-        
-        if result['success']:
-            stats = result['analysis_info']['statistics']
-            left_kp = stats['left_keypoints_count']
-            right_kp = stats['right_keypoints_count']
-            total_intervals = stats['total_intervals_count']
-            critical_ratio = stats['critical_ratio']
+    for task_type, task_name in test_configs:
+        for i, file_path in enumerate(test_files[:1]):  # 每种任务测试1个文件
+            result = process_hdf5_file_with_task(file_path, task_type)
             
-            skip_steps = config['keypoint_skip_steps']
-            
-            print(f"{config['relative_low_speed_ratio']:7.2f} | {config['min_deceleration_threshold']:9.4f} | "
-                  f"{skip_steps:8d} | {left_kp:8d} | {right_kp:8d} | {total_intervals:8d} | {critical_ratio:7.3f}")
-        else:
-            print(f"配置{i+1}: 错误 - {result.get('error', 'Unknown error')[:30]}")
+            if result['success']:
+                stats = result['analysis_info']['statistics']
+                left_has = "✓" if stats['left_has_segment'] else "✗"
+                right_has = "✓" if stats['right_has_segment'] else "✗"
+                total_segments = stats['total_segments']
+                critical_ratio = stats['critical_ratio']
+                
+                file_short = os.path.basename(file_path)[:20] + "..."
+                print(f"{task_name:8s} | {file_short:20s} | {left_has:6s} | {right_has:6s} | {total_segments:6d} | {critical_ratio:7.3f} | 成功")
+            else:
+                file_short = os.path.basename(file_path)[:20] + "..."
+                print(f"{task_name:8s} | {file_short:20s} | {'错误':6s} | {'错误':6s} | {'0':6s} | {'0.000':7s} | 失败")
     
     print(f"\n✅ 测试完成!")
-    print(f"💡 双关键点区间检测说明 (已更新 - 新增跳过逻辑):")
-    print(f"   📊 当前默认参数:")
-    print(f"      - 低速比例: 10% (relative_low_speed_ratio=0.1)")
-    print(f"      - 减速阈值: -0.0005 (更宽松，原来是-0.001)")
-    print(f"      - 跳过步数: 10 (keypoint_skip_steps=10) 🆕")
-    print(f"   🤝 双臂联合检测逻辑:")
-    print(f"      - 左臂和右臂分别检测关键点和区间")
-    print(f"      - 任一臂有有效区间就标注该区间")
-    print(f"      - 两臂都有区间时，两臂的区间都会被标注")
-    print(f"      - 重叠区间会被自动合并")
-    print(f"   🔗 配对规则:")
-    print(f"      - 第1和第2个关键点配对，第3和第4个配对，以此类推")
-    print(f"      - 奇数个关键点时，最后一个点会被忽略")
-    print(f"   ⏭️ 跳过逻辑 (新增):")
-    print(f"      - 检测到关键点后跳过{test_configs[0]['keypoint_skip_steps']}步再继续检测")
-    print(f"      - 避免连续的关键点造成过短区间")
-    print(f"      - 提高关键点间距，增加有效区间的概率")
+    print(f"💡 任务驱动标注说明:")
+    print(f"   📊 抓取类任务 (task_type=1):")
+    print(f"      - 检测逻辑: 减速对准 → 夹爪闭合")
+    print(f"      - 关键时间段: 从减速低速点到夹爪闭合点")
+    print(f"      - 适用场景: 精细抓取、物体操纵")
+    print(f"   🖱️ 点击类任务 (task_type=2):")
+    print(f"      - 检测逻辑: 夹爪闭合 → 减速对准")
+    print(f"      - 关键时间段: 从夹爪闭合点到减速低速点")
+    print(f"      - 适用场景: 按钮点击、触摸交互")
+    print(f"   🤖 双臂策略:")
+    print(f"      - 每臂独立检测，最多一个关键时间段")
+    print(f"      - 任何一臂处于关键时间段即为关键时间段")
+    print(f"      - 支持双臂协调操作的标注")
 
-def visualize_critical_detection(file_path: str, save_path: str = "critical_analysis.png"):
-    """
-    可视化关键时间段检测结果
-    
-    Args:
-        file_path: HDF5文件路径
-        save_path: 保存图像路径
-    """
-    import matplotlib.pyplot as plt
-    
-    # 创建标注器
-    annotator = AgilexDualKeypointAnnotator()
-    
-    # 读取数据
-    with h5py.File(file_path, 'r') as f:
-        qpos = f['observations']['qpos'][:]
-    
-    # 执行标注
-    critical_labels, analysis_info = annotator.annotate(qpos)
-    
-    # 提取分析数据
-    left_velocity = analysis_info['left_velocity']
-    right_velocity = analysis_info['right_velocity']
-    left_keypoints = analysis_info['left_keypoints']
-    right_keypoints = analysis_info['right_keypoints']
-    
-    # 创建图形
-    fig, axes = plt.subplots(3, 1, figsize=(12, 8))
-    time_steps = range(len(left_velocity))
-    
-    # 图1：左臂速度和关键点
-    ax1 = axes[0]
-    ax1.plot(time_steps, left_velocity, 'b-', label='Left Arm Velocity')
-    for kp in left_keypoints:
-        ax1.axvline(x=kp, color='r', linestyle='--', alpha=0.5)
-    ax1.set_ylabel('Velocity (m/s)')
-    ax1.set_title('Left Arm Analysis')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    
-    # 图2：右臂速度和关键点
-    ax2 = axes[1]
-    ax2.plot(time_steps, right_velocity, 'g-', label='Right Arm Velocity')
-    for kp in right_keypoints:
-        ax2.axvline(x=kp, color='r', linestyle='--', alpha=0.5)
-    ax2.set_ylabel('Velocity (m/s)')
-    ax2.set_title('Right Arm Analysis')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    
-    # 图3：关键时间段标签
-    ax3 = axes[2]
-    ax3.fill_between(time_steps, 0, critical_labels, alpha=0.5, color='orange')
-    ax3.set_ylabel('Critical (0/1)')
-    ax3.set_xlabel('Time Step')
-    ax3.set_title('Critical Timesteps (1=Critical, 0=Non-critical)')
-    ax3.set_ylim(-0.1, 1.1)
-    ax3.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f"✅ 可视化结果保存到: {save_path}")
-    
-    # 打印统计信息
-    critical_ratio = np.mean(critical_labels)
-    print(f"\n📊 关键时间段统计:")
-    print(f"  - 总步数: {len(critical_labels)}")
-    print(f"  - 关键步数: {np.sum(critical_labels)}")
-    print(f"  - 关键比例: {critical_ratio:.2%}")
-    print(f"  - 左臂关键点数: {len(left_keypoints)}")
-    print(f"  - 右臂关键点数: {len(right_keypoints)}")
-    
-    return critical_labels, analysis_info
+
 if __name__ == "__main__":
     import sys
     
     if len(sys.argv) == 1:
-        # 无参数时运行快速测试
-        quick_test()
+        # 无参数时运行测试
+        test_task_annotators()
     else:
         # 命令行参数处理
         import argparse
-        parser = argparse.ArgumentParser(description="Agilex双关键点区间标注器（双臂联合检测）")
+        parser = argparse.ArgumentParser(description="任务驱动关键时间段标注器")
         parser.add_argument("--file", type=str, help="指定HDF5文件路径")
-        parser.add_argument("--data_dir", type=str, help="数据目录路径")
-        parser.add_argument("--max_files", type=int, default=10, help="最大处理文件数")
-        parser.add_argument("--relative_low_speed_ratio", type=float, default=0.1, help="相对低速比例（默认10%）")
-        parser.add_argument("--min_deceleration_threshold", type=float, default=-0.0005, help="最小减速度阈值（默认-0.0005，更宽松）")
-        parser.add_argument("--min_interval_steps", type=int, default=5, help="最小区间长度")
-        parser.add_argument("--max_interval_steps", type=int, default=100, help="最大区间长度")
-        parser.add_argument("--keypoint_skip_steps", type=int, default=10, help="检测到关键点后跳过的步数（默认10）")
+        parser.add_argument("--task_type", type=int, choices=[1, 2], required=True, 
+                          help="任务类型: 1=抓取类, 2=点击类")
+        parser.add_argument("--verbose", action="store_true", help="显示详细信息")
         
         args = parser.parse_args()
         
         if args.file:
             # 处理单个文件
-            result = process_hdf5_file(
-                args.file,
-                args.relative_low_speed_ratio,
-                args.min_deceleration_threshold,
-                args.min_interval_steps,
-                args.max_interval_steps,
-                args.keypoint_skip_steps
-            )
+            result = process_hdf5_file_with_task(args.file, TaskType(args.task_type))
             
             if result['success']:
                 stats = result['analysis_info']['statistics']
-                print(f"✅ 处理成功")
-                print(f"左臂关键点: {stats['left_keypoints_count']}")
-                print(f"右臂关键点: {stats['right_keypoints_count']}")
-                print(f"有效区间数: {stats['total_intervals_count']}")
-                print(f"关键比例: {stats['critical_ratio']:.3f}")
+                task_name = result['analysis_info']['task_name']
+                print(f"✅ {task_name}标注成功")
+                print(f"   左臂时间段: {'有' if stats['left_has_segment'] else '无'}")
+                print(f"   右臂时间段: {'有' if stats['right_has_segment'] else '无'}")
+                print(f"   总时间段数: {stats['total_segments']}")
+                print(f"   关键比例: {stats['critical_ratio']:.3f}")
             else:
-                print(f"❌ 处理失败: {result.get('error')}")
-        elif args.data_dir:
-            # 批量处理
-            batch_results = batch_process_dataset(
-                args.data_dir, 
-                args.relative_low_speed_ratio, 
-                args.min_deceleration_threshold,
-                args.min_interval_steps,
-                args.max_interval_steps,
-                args.keypoint_skip_steps,
-                args.max_files
-            )
+                print(f"❌ 标注失败: {result.get('error')}")
         else:
-            # 运行测试
-            quick_test()
+            print("❌ 请提供文件路径 --file")
+
+
+# 🆕 集成到数据集的便捷函数
+def create_silent_task_annotator(task_type: TaskType):
+    """创建静默的任务标注器（用于训练）"""
+    return TaskDrivenCriticalTimestepAnnotator(
+        task_type=task_type,
+        relative_low_speed_ratio=0.15,
+        min_deceleration_threshold=-0.0008,
+        gripper_close_delta_threshold=0.01,  # 🔧 夹爪闭合变化阈值  
+        smooth=True,
+        verbose=False  # 🔧 关闭所有打印信息
+    )
