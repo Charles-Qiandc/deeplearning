@@ -92,6 +92,7 @@ class VLAConsumerDataset(Dataset):
         use_precomp_lang_embed=False,
         use_dinov2_features=False,
         use_depth_features=False,  # 🆕 新增深度特征支持
+        task_type: int = 1,  # 🆕 新增：任务类型参数
     ):
         super(VLAConsumerDataset, self).__init__()
 
@@ -147,7 +148,10 @@ class VLAConsumerDataset(Dataset):
 
         self.last_content = None
         self.last_meta = None
-
+        # 🆕 任务类型配置
+        self.task_type = TaskType(task_type)
+        from data.critical_timestep_annotator import create_silent_task_annotator
+        self.critical_annotator = create_silent_task_annotator(self.task_type)
     def get_dataset_name2id(self):
         return self.dataset_name2id
 

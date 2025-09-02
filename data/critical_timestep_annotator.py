@@ -186,28 +186,48 @@ class TaskDrivenCriticalTimestepAnnotator:
             gripper_close_points: 夹爪开始闭合的时间点列表
         """
         gripper_close_points = []
+    
+        # 🔧 新增：检测静态臂
+        gripper_range = gripper_trajectory.max() - gripper_trajectory.min()
+        gripper_std = gripper_trajectory.std()
+        
+        # 如果夹爪基本不动，认为是静态臂，跳过检测
+        if gripper_range < 0.01 and gripper_std < 0.01:
+            if self.verbose:
+                print(f"    ℹ️  {arm_name}臂检测为静态臂（范围:{gripper_range:.4f}, 标准差:{gripper_std:.4f}），跳过夹爪检测")
+            return []
         
         # 计算夹爪开度的变化率（负值表示闭合）
         gripper_delta = np.diff(gripper_trajectory, prepend=gripper_trajectory[0])
         
-        # 检测夹爪开始显著闭合的时间点
+        # 🔧 修正：只检测真正显著的闭合动作
         for t in range(1, len(gripper_delta)):
-            # 夹爪闭合：当前变化为负且变化量超过阈值
-            if gripper_delta[t] < -self.gripper_close_delta_threshold:
+            # 条件1：变化为负且超过阈值（闭合动作）
+            is_closing = gripper_delta[t] < self.gripper_close_delta_threshold
+            
+            # 条件2：变化量足够大，排除数值误差 (1%的变化才认为是真实动作)
+            is_significant = abs(gripper_delta[t]) > 0.01
+            
+            # 条件3：确保不是从0开始的误判（防止初始值问题）
+            is_valid_timing = t > 0
+            
+            if is_closing and is_significant and is_valid_timing:
                 gripper_close_points.append(t)
                 if self.verbose:
                     print(f"    🤏 {arm_name}臂夹爪开始闭合: 步骤 {t}, 开度={gripper_trajectory[t]:.4f}, 变化量={gripper_delta[t]:.4f}")
         
-        # 🔧 去重：如果连续多个时间点都检测到闭合，只保留第一个
+        # 🔧 改进去重：如果连续多个时间点都检测到闭合，只保留第一个
         if len(gripper_close_points) > 1:
             filtered_points = [gripper_close_points[0]]
             for point in gripper_close_points[1:]:
-                if point - filtered_points[-1] > 5:  # 至少间隔5步
+                # 至少间隔3步才认为是新的闭合动作
+                if point - filtered_points[-1] > 3:
                     filtered_points.append(point)
-            gripper_close_points = filtered_points
             
-            if self.verbose and len(filtered_points) < len(gripper_close_points):
+            if len(filtered_points) < len(gripper_close_points) and self.verbose:
                 print(f"    🔄 {arm_name}臂去重后夹爪闭合点: {filtered_points}")
+                
+            gripper_close_points = filtered_points
         
         return gripper_close_points
     
@@ -460,7 +480,7 @@ class TaskDrivenCriticalTimestepAnnotator:
                 }
             }
         }
-        }
+        
         
         if self.verbose:
             print(f"\n📊 标注结果:")
@@ -487,7 +507,7 @@ def create_task_annotator(task_type: TaskType, verbose: bool = False):
         task_type=task_type,
         relative_low_speed_ratio=0.15,
         min_deceleration_threshold=-0.0008,
-        gripper_close_delta_threshold=0.01,  # 🔧 夹爪闭合变化阈值
+        gripper_close_delta_threshold=-0.01,  # 🔧 夹爪闭合变化阈值
         smooth=True,
         verbose=verbose
     )
