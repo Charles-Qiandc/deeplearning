@@ -31,12 +31,15 @@ from train.sample import log_sample_res
 from models.multimodal_encoder.dinov2_encoder import create_dinov2_encoder
 from models.multimodal_encoder.depth_encoder import create_depth_encoder
 
+# 🆕 导入关键时间段标注器
+from data.critical_timestep_annotator import TaskType
+
 if is_wandb_available():
     import wandb
 
 
 def save_model_card(repo_id: str, base_model=str, repo_folder=None):
-    yaml = f"""
+    yaml_header = f"""
 ---
 license: mit
 base_model: {base_model}
@@ -54,21 +57,28 @@ tags:
 - rdt
 - repa
 - dual-teachers
+- critical-timestep
 ---
     """
     model_card = f"""
-# RDT with Dual-Teacher REPA - {repo_id}
+# RDT with Dual-Teacher REPA and Critical Timestep Annotation - {repo_id}
 
-This is a RDT model with dual-teacher REPA alignment loss derived from {base_model}. 
+This is a RDT model with dual-teacher REPA alignment loss and task-driven critical timestep annotation derived from {base_model}. 
 The weights were trained using [RDT](https://rdt-robotics.github.io/rdt-robotics/) 
 with dual visual alignment using DINOv2 (global semantic) and DepthAnythingV2 (depth geometric) features.
 
-## Dual-Teacher Alignment Strategy
+## Key Features
+- **Dual-Teacher Alignment Strategy**: Dynamic routing between global semantic and depth geometric experts
+- **Critical Timestep Annotation**: Task-driven annotation for precise temporal alignment
 - **Non-critical timesteps**: Action tokens align with DINOv2 CLS token (global semantics)
 - **Critical timesteps**: Action tokens align with DepthAnythingV2 CLS token (depth geometry)
+
+## Task Types Supported
+- **Grasp Tasks (task_type=1)**: Deceleration → Gripper closing alignment
+- **Click Tasks (task_type=2)**: Gripper closing → Deceleration alignment
 """
     with open(os.path.join(repo_folder, "README.md"), "w") as f:
-        f.write(yaml + model_card)
+        f.write(yaml_header + model_card)
 
 
 def train(args, logger):
@@ -133,19 +143,28 @@ def train(args, logger):
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
-    # 🆕 获取双教师REPA配置
+    # 🆕 获取双教师REPA和关键时间段标注配置
     enable_repa_loss = model_config.get("enable_repa_loss", True)
     repa_loss_weight = model_config.get("repa_loss_weight", 0.2)
     use_dinov2_features = model_config.get("use_dinov2_features", True)
     use_depth_features = model_config.get("use_depth_features", True)
     routing_loss_weight = model_config.get("routing_loss_weight", 0.1)
     
-    logger.info(f"🔧 双教师REPA配置:")
+    # 🆕 关键时间段标注配置
+    enable_critical_annotation = model_config.get("enable_critical_annotation", True)
+    task_type = model_config.get("task_type", 1)  # 1=抓取类, 2=点击类
+    critical_annotation_config = model_config.get("critical_annotation_config", {})
+    
+    logger.info(f"🔧 双教师REPA + 关键时间段标注配置:")
     logger.info(f"   - REPA损失启用: {enable_repa_loss}")
     logger.info(f"   - REPA损失权重: {repa_loss_weight}")
     logger.info(f"   - 使用DINOv2特征: {use_dinov2_features}")
     logger.info(f"   - 使用深度特征: {use_depth_features}")
     logger.info(f"   - 路由损失权重: {routing_loss_weight}")
+    logger.info(f"   - 关键时间段标注: {enable_critical_annotation}")
+    logger.info(f"   - 任务类型: {TaskType(task_type).name} ({task_type})")
+    if critical_annotation_config:
+        logger.info(f"   - 标注配置: {critical_annotation_config}")
 
     # 文本编码器
     if args.precomp_lang_embed:
@@ -290,7 +309,7 @@ def train(args, logger):
         eps=args.adam_epsilon,
     )
 
-    # 数据集和数据加载器
+    # 🆕 数据集和数据加载器（集成关键时间段标注）
     train_dataset = VLAConsumerDataset(
         model_config_path=args.model_config_path,
         config=config["dataset"],
@@ -306,7 +325,11 @@ def train(args, logger):
         use_hdf5=args.load_from_hdf5,
         use_precomp_lang_embed=args.precomp_lang_embed,
         use_dinov2_features=use_dinov2_features,
-        use_depth_features=use_depth_features,  # 🆕
+        use_depth_features=use_depth_features,
+        # 🆕 关键时间段标注参数
+        task_type=task_type,
+        enable_critical_annotation=enable_critical_annotation,
+        critical_annotation_config=critical_annotation_config,
     )
     
     sample_dataset = VLAConsumerDataset(
@@ -324,7 +347,11 @@ def train(args, logger):
         use_hdf5=args.load_from_hdf5,
         use_precomp_lang_embed=args.precomp_lang_embed,
         use_dinov2_features=use_dinov2_features,
-        use_depth_features=use_depth_features,  # 🆕
+        use_depth_features=use_depth_features,
+        # 🆕 关键时间段标注参数（采样时也启用）
+        task_type=task_type,
+        enable_critical_annotation=enable_critical_annotation,
+        critical_annotation_config=critical_annotation_config,
     )
 
     data_collator = DataCollatorForVLAConsumerDataset(tokenizer)
@@ -386,18 +413,25 @@ def train(args, logger):
 
     # 初始化追踪器
     if accelerator.is_main_process:
+        tracker_config = vars(args).copy()
+        tracker_config.update({
+            'task_type': task_type,
+            'enable_critical_annotation': enable_critical_annotation,
+            'critical_annotation_config': critical_annotation_config,
+        })
+        
         accelerator.init_trackers(
-            "VLA_Dual_Teacher_REPA",
-            config=vars(args),
+            "VLA_Dual_Teacher_REPA_Critical",
+            config=tracker_config,
             init_kwargs={"wandb": {
-                "name": f"RDT_DualTeacher_{args.CONFIG_NAME}",
+                "name": f"RDT_DualTeacher_Critical_{TaskType(task_type).name}_{args.CONFIG_NAME}",
             }},
         )
 
     # 训练信息
     total_batch_size = (args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps)
 
-    logger.info("***** 开始双教师REPA训练 *****")
+    logger.info("***** 开始双教师REPA + 关键时间段标注训练 *****")
     logger.info(f"  样本数量 = {len(train_dataset)}")
     logger.info(f"  每epoch批次数 = {len(train_dataloader)}")
     logger.info(f"  Epoch数 = {args.num_train_epochs}")
@@ -405,6 +439,7 @@ def train(args, logger):
     logger.info(f"  总训练批次大小 = {total_batch_size}")
     logger.info(f"  梯度累积步数 = {args.gradient_accumulation_steps}")
     logger.info(f"  总优化步数 = {args.max_train_steps}")
+    logger.info(f"  任务类型 = {TaskType(task_type).name}")
     
     global_step = 0
     first_epoch = 0
@@ -446,6 +481,14 @@ def train(args, logger):
     )
     progress_bar.set_description("Steps")
 
+    # 🆕 用于记录关键时间段标注统计的变量
+    critical_stats = {
+        'total_samples': 0,
+        'critical_timesteps': 0,
+        'global_expert_usage': 0.0,
+        'depth_expert_usage': 0.0,
+    }
+    
     loss_for_log = {}
     
     # 训练循环
@@ -464,7 +507,17 @@ def train(args, logger):
                 state_elem_mask = batch["state_elem_mask"].to(dtype=weight_dtype)
                 ctrl_freqs = batch["ctrl_freqs"]
 
-                # 🆕 编码原始图像（SigLIP）
+                # 🆕 获取关键时间段标签
+                critical_labels = batch.get("critical_labels", None)
+                if critical_labels is not None:
+                    critical_labels = critical_labels.to(accelerator.device)
+                    
+                    # 统计关键时间段信息
+                    batch_size, seq_len = critical_labels.shape
+                    critical_stats['total_samples'] += batch_size * seq_len
+                    critical_stats['critical_timesteps'] += critical_labels.sum().item()
+
+                # 编码原始图像（SigLIP）
                 with torch.no_grad():
                     batch_size, _, C, H, W = images.shape
                     image_embeds = vision_encoder(images.reshape(-1, C, H, W)).detach()
@@ -492,27 +545,7 @@ def train(args, logger):
                         depth_input = depth_images[:, 0]  # (B, 3, 518, 518)
                         depth_features, _ = depth_encoder(depth_input)  # (B, 1370, 1024)
 
-                # 🆕 生成关键时间段标签
-                critical_labels = None
-                if "qpos_trajectory" in batch and batch["qpos_trajectory"] is not None:
-                    from data.critical_timestep_annotator import create_silent_annotator
-                    annotator = create_silent_annotator()
-                    
-                    batch_critical_labels = []
-                    for i in range(batch["qpos_trajectory"].shape[0]):
-                        qpos = batch["qpos_trajectory"][i].cpu().numpy()
-                        labels, _ = annotator.annotate(qpos)
-                        # 只取前64步（对应action horizon）
-                        labels = labels[:config["common"]["action_chunk_size"]]
-                        if len(labels) < config["common"]["action_chunk_size"]:
-                            # 如果不足64步，用0填充
-                            padding = config["common"]["action_chunk_size"] - len(labels)
-                            labels = np.concatenate([labels, np.zeros(padding)])
-                        batch_critical_labels.append(torch.from_numpy(labels))
-                    
-                    critical_labels = torch.stack(batch_critical_labels).to(accelerator.device)
-
-                # 🆕 计算双教师REPA损失
+                # 🆕 计算双教师REPA损失（使用关键时间段标签）
                 state_elem_mask = state_elem_mask.unsqueeze(1)
                 if enable_repa_loss:
                     total_loss, diffusion_loss, repa_loss, routing_loss, intermediate_activations = accelerator.unwrap_model(rdt).compute_loss(
@@ -525,7 +558,7 @@ def train(args, logger):
                         ctrl_freqs=ctrl_freqs,
                         cls_token=cls_token,              
                         depth_features=depth_features,   
-                        critical_labels=critical_labels,
+                        critical_labels=critical_labels,  # 🆕 传入关键时间段标签
                     )
                     loss = total_loss
                     
@@ -534,7 +567,7 @@ def train(args, logger):
                     loss_for_log["repa_loss"] = repa_loss.detach().item()
                     loss_for_log["routing_loss"] = routing_loss.detach().item()
                     
-                    # 记录关键时间段统计
+                    # 🆕 记录关键时间段和路由统计
                     if critical_labels is not None:
                         critical_ratio = critical_labels.float().mean().item()
                         loss_for_log["critical_ratio"] = critical_ratio
@@ -546,8 +579,30 @@ def train(args, logger):
                             depth_usage = routing_weights[:, :, 1].mean().item()
                             loss_for_log["global_expert_usage"] = global_usage
                             loss_for_log["depth_expert_usage"] = depth_usage
+                            
+                            # 更新累积统计
+                            critical_stats['global_expert_usage'] = (
+                                critical_stats['global_expert_usage'] * 0.99 + global_usage * 0.01
+                            )
+                            critical_stats['depth_expert_usage'] = (
+                                critical_stats['depth_expert_usage'] * 0.99 + depth_usage * 0.01
+                            )
+                            
+                            # 记录关键时间段的专家选择准确率
+                            if critical_labels is not None:
+                                # 计算在关键时间段选择深度专家的比例
+                                critical_mask = critical_labels.bool()
+                                if critical_mask.any():
+                                    critical_depth_usage = routing_weights[critical_mask][:, 1].mean().item()
+                                    loss_for_log["critical_depth_expert_accuracy"] = critical_depth_usage
+                                
+                                # 计算在非关键时间段选择全局专家的比例
+                                non_critical_mask = ~critical_mask
+                                if non_critical_mask.any():
+                                    non_critical_global_usage = routing_weights[non_critical_mask][:, 0].mean().item()
+                                    loss_for_log["non_critical_global_expert_accuracy"] = non_critical_global_usage
                 else:
-                    # 原始方式
+                    # 原始方式（兼容性）
                     loss = rdt(
                         lang_tokens=text_embeds,
                         lang_attn_mask=lang_attn_mask,
@@ -557,6 +612,7 @@ def train(args, logger):
                         action_mask=state_elem_mask,
                         ctrl_freqs=ctrl_freqs,
                     )
+                    loss_for_log["diffusion_loss"] = loss.detach().item()
 
                 # 反向传播
                 accelerator.backward(loss)
@@ -582,6 +638,19 @@ def train(args, logger):
                     accelerator.save_model(ema_rdt, ema_save_path)
                     logger.info(f"💾 保存状态到 {save_path}")
 
+                # 🆕 每隔一段时间记录关键时间段统计信息
+                if global_step % 100 == 0 and critical_stats['total_samples'] > 0:
+                    overall_critical_ratio = critical_stats['critical_timesteps'] / critical_stats['total_samples']
+                    logger.info(f"📊 关键时间段统计 (步骤 {global_step}):")
+                    logger.info(f"   - 总体关键时间段比例: {overall_critical_ratio:.3f}")
+                    logger.info(f"   - 全局专家平均使用率: {critical_stats['global_expert_usage']:.3f}")
+                    logger.info(f"   - 深度专家平均使用率: {critical_stats['depth_expert_usage']:.3f}")
+                    
+                    # 记录到wandb
+                    loss_for_log["overall_critical_ratio"] = overall_critical_ratio
+                    loss_for_log["cumulative_global_expert_usage"] = critical_stats['global_expert_usage']
+                    loss_for_log["cumulative_depth_expert_usage"] = critical_stats['depth_expert_usage']
+
                 if args.sample_period > 0 and global_step % args.sample_period == 0:
                     sample_loss_for_log = log_sample_res(
                         text_encoder,
@@ -606,6 +675,16 @@ def train(args, logger):
             if global_step >= args.max_train_steps:
                 break
 
+    # 🆕 训练结束时的统计总结
+    if accelerator.is_main_process and critical_stats['total_samples'] > 0:
+        final_critical_ratio = critical_stats['critical_timesteps'] / critical_stats['total_samples']
+        logger.info("🎯 训练完成 - 关键时间段标注统计总结:")
+        logger.info(f"   - 处理的总时间步数: {critical_stats['total_samples']}")
+        logger.info(f"   - 关键时间步数: {critical_stats['critical_timesteps']}")
+        logger.info(f"   - 最终关键时间段比例: {final_critical_ratio:.3f}")
+        logger.info(f"   - 全局专家最终使用率: {critical_stats['global_expert_usage']:.3f}")
+        logger.info(f"   - 深度专家最终使用率: {critical_stats['depth_expert_usage']:.3f}")
+
     # 保存最终模型
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
@@ -614,6 +693,25 @@ def train(args, logger):
         accelerator.save_model(ema_rdt, ema_save_path)
 
         logger.info(f"💾 保存模型到 {args.output_dir}")
+
+        # 🆕 保存训练配置和统计信息
+        final_config = {
+            'task_type': task_type,
+            'task_name': TaskType(task_type).name,
+            'enable_critical_annotation': enable_critical_annotation,
+            'critical_annotation_config': critical_annotation_config,
+            'final_statistics': {
+                'total_timesteps': critical_stats['total_samples'],
+                'critical_timesteps': critical_stats['critical_timesteps'],
+                'critical_ratio': final_critical_ratio if critical_stats['total_samples'] > 0 else 0.0,
+                'global_expert_usage': critical_stats['global_expert_usage'],
+                'depth_expert_usage': critical_stats['depth_expert_usage'],
+            }
+        }
+        
+        import json
+        with open(os.path.join(args.output_dir, "training_config.json"), "w") as f:
+            json.dump(final_config, f, indent=2)
 
         if args.push_to_hub:
             save_model_card(
@@ -624,7 +722,7 @@ def train(args, logger):
             upload_folder(
                 repo_id=repo_id,
                 folder_path=args.output_dir,
-                commit_message="End of dual-teacher REPA training",
+                commit_message="End of dual-teacher REPA + critical timestep training",
                 token=args.hub_token,
                 allow_patterns=["pytorch_model.bin", "*.json", "*.md"],
             )

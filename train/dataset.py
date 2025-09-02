@@ -1,3 +1,5 @@
+# train/dataset.py - 更新版本，集成任务驱动的关键时间段标注
+
 import traceback
 import time
 import os
@@ -16,6 +18,13 @@ import transformers
 from data.filelock import FileLock
 from data.hdf5_vla_dataset import HDF5VLADataset
 from train.image_corrupt import image_corrupt
+
+# 🆕 导入任务驱动的关键时间段标注器
+from data.critical_timestep_annotator import (
+    TaskType, 
+    create_silent_task_annotator,
+    TaskDrivenCriticalTimestepAnnotator
+)
 
 
 def get_clean_item(chunk_dir):
@@ -69,8 +78,7 @@ def read_dirty_bit(chunk_dir):
 
 class VLAConsumerDataset(Dataset):
     """A vision-language-action Dataset for supervised training.
-    This dataset will load data from the buffer directory.
-    🆕 支持双教师REPA的深度图像预处理
+    🆕 集成任务驱动的关键时间段标注机制
     """
 
     def __init__(
@@ -91,8 +99,11 @@ class VLAConsumerDataset(Dataset):
         use_hdf5=False,
         use_precomp_lang_embed=False,
         use_dinov2_features=False,
-        use_depth_features=False,  # 🆕 新增深度特征支持
-        task_type: int = 1,  # 🆕 新增：任务类型参数
+        use_depth_features=False,
+        # 🆕 关键时间段标注相关参数
+        task_type: int = 1,  # 1=抓取类, 2=点击类
+        enable_critical_annotation: bool = True,
+        critical_annotation_config: Dict = None,
     ):
         super(VLAConsumerDataset, self).__init__()
 
@@ -128,13 +139,13 @@ class VLAConsumerDataset(Dataset):
         if use_precomp_lang_embed:
             self.empty_lang_embed = torch.load("data/empty_lang_embed.pt")
         
-        # DINOv2相关配置（现有）
+        # DINOv2相关配置
         self.use_dinov2_features = use_dinov2_features
         self.dinov2_image_size = 518
         
-        # 🆕 DepthAnythingV2相关配置
+        # DepthAnythingV2相关配置
         self.use_depth_features = use_depth_features
-        self.depth_image_size = 518  # DepthAnythingV2期望的输入尺寸
+        self.depth_image_size = 518
 
         # Load dataset stat
         with open("configs/dataset_stat.json", "r") as f:
@@ -148,10 +159,38 @@ class VLAConsumerDataset(Dataset):
 
         self.last_content = None
         self.last_meta = None
-        # 🆕 任务类型配置
+        
+        # 🆕 关键时间段标注配置
         self.task_type = TaskType(task_type)
-        from data.critical_timestep_annotator import create_silent_task_annotator
-        self.critical_annotator = create_silent_task_annotator(self.task_type)
+        self.enable_critical_annotation = enable_critical_annotation
+        
+        if enable_critical_annotation:
+            # 设置默认配置
+            default_config = {
+                'relative_low_speed_ratio': 0.15,
+                'min_deceleration_threshold': -0.0008,
+                'gripper_close_delta_threshold': -0.01,
+                'smooth': True,
+                'verbose': False
+            }
+            
+            # 合并用户配置
+            if critical_annotation_config:
+                default_config.update(critical_annotation_config)
+            
+            # 创建标注器
+            self.critical_annotator = TaskDrivenCriticalTimestepAnnotator(
+                task_type=self.task_type,
+                **default_config
+            )
+            
+            print(f"🎯 关键时间段标注器初始化:")
+            print(f"   - 任务类型: {self.task_type.name} ({self.task_type.value})")
+            print(f"   - 配置: {default_config}")
+        else:
+            self.critical_annotator = None
+            print("⚠️  关键时间段标注已禁用")
+
     def get_dataset_name2id(self):
         return self.dataset_name2id
 
@@ -238,6 +277,40 @@ class VLAConsumerDataset(Dataset):
 
         return (content, *meta)
 
+    def _generate_critical_labels(self, qpos_trajectory, action_horizon=64):
+        """
+        🆕 生成关键时间段标签
+        
+        Args:
+            qpos_trajectory: (T, 14) numpy数组，关节角度轨迹
+            action_horizon: 动作预测的时间范围
+            
+        Returns:
+            critical_labels: (action_horizon,) torch tensor，关键时间段标签
+        """
+        if self.critical_annotator is None or qpos_trajectory is None:
+            # 如果没有标注器或轨迹数据，返回全0标签
+            return torch.zeros(action_horizon, dtype=torch.long)
+        
+        try:
+            # 使用标注器生成标签
+            critical_labels, analysis_info = self.critical_annotator.annotate(qpos_trajectory)
+            
+            # 只取前action_horizon步
+            critical_labels = critical_labels[:action_horizon]
+            
+            # 如果不足action_horizon步，用0填充
+            if len(critical_labels) < action_horizon:
+                padding_len = action_horizon - len(critical_labels)
+                critical_labels = np.concatenate([critical_labels, np.zeros(padding_len, dtype=critical_labels.dtype)])
+            
+            return torch.from_numpy(critical_labels).long()
+            
+        except Exception as e:
+            print(f"⚠️ 关键时间段标注失败: {e}")
+            # 失败时返回全0标签
+            return torch.zeros(action_horizon, dtype=torch.long)
+
     def __getitem__(self, index):
         # For robustness, we will try to load the data until we succeed
         while True:
@@ -300,9 +373,25 @@ class VLAConsumerDataset(Dataset):
                                                 np.zeros_like(state_elem_mask))
                 data_dict["state_norm"] = state_norm
 
-                # 🆕 保存qpos轨迹
-                if qpos_trajectory is not None:
-                    data_dict["qpos_trajectory"] = qpos_trajectory
+                # 🆕 生成关键时间段标签
+                if self.enable_critical_annotation and qpos_trajectory is not None:
+                    try:
+                        action_horizon = actions.shape[0]  # 动作序列长度
+                        critical_labels = self._generate_critical_labels(qpos_trajectory, action_horizon)
+                        data_dict["critical_labels"] = critical_labels
+                        
+                        # 可选：记录标注统计信息（用于调试）
+                        if hasattr(self.critical_annotator, 'verbose') and self.critical_annotator.verbose:
+                            critical_ratio = critical_labels.float().mean().item()
+                            print(f"📊 样本 {index}: 关键时间段比例 = {critical_ratio:.3f}")
+                            
+                    except Exception as e:
+                        print(f"⚠️ 样本 {index} 关键时间段标注失败: {e}")
+                        # 失败时使用全0标签
+                        data_dict["critical_labels"] = torch.zeros(actions.shape[0], dtype=torch.long)
+                else:
+                    # 如果没有启用标注或没有qpos数据，使用全0标签
+                    data_dict["critical_labels"] = torch.zeros(actions.shape[0], dtype=torch.long)
 
                 # Background image for padding/masking
                 background_color = np.array(
@@ -333,7 +422,7 @@ class VLAConsumerDataset(Dataset):
                         else:
                             rearranged_images.append((background_image.copy(), False))
 
-                # 🆕 为DINOv2准备单独的图像（现有代码保持不变）
+                # 为DINOv2准备单独的图像
                 if self.use_dinov2_features:
                     camera_idx = 0
                     frame_idx = self.img_history_size - 1
@@ -358,12 +447,12 @@ class VLAConsumerDataset(Dataset):
                     std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
                     image_tensor = (image_tensor - mean) / std
                     
-                    data_dict["dinov2_images"] = image_tensor.unsqueeze(0)  # (1, 3, 518, 518)
+                    data_dict["dinov2_images"] = image_tensor.unsqueeze(0)
 
-                # 🆕 为DepthAnythingV2准备深度图像
+                # 为DepthAnythingV2准备深度图像
                 if self.use_depth_features:
-                    camera_idx = 0  # 使用第一个相机
-                    frame_idx = self.img_history_size - 1  # 使用最新帧
+                    camera_idx = 0
+                    frame_idx = self.img_history_size - 1
                     
                     if camera_idx >= len(image_metas):
                         raise ValueError(f"深度编码器相机索引 {camera_idx} 超出范围")
@@ -374,18 +463,18 @@ class VLAConsumerDataset(Dataset):
                     if not valid or math.prod(image.shape) <= 0:
                         raise ValueError(f"深度编码器图像无效")
                     
-                    # DepthAnythingV2预处理：直接resize到518x518
+                    # DepthAnythingV2预处理
                     pil_image = Image.fromarray(image)
                     pil_image = pil_image.resize((self.depth_image_size, self.depth_image_size), Image.BILINEAR)
                     image_array = np.array(pil_image).astype(np.float32) / 255.0
                     image_tensor = torch.from_numpy(image_array).permute(2, 0, 1)
                     
-                    # ImageNet标准化（DepthAnythingV2使用相同的标准化）
+                    # ImageNet标准化
                     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
                     std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
                     image_tensor = (image_tensor - mean) / std
                     
-                    data_dict["depth_images"] = image_tensor.unsqueeze(0)  # (1, 3, 518, 518)
+                    data_dict["depth_images"] = image_tensor.unsqueeze(0)
 
                 # 处理原始图像（SigLIP编码用）
                 preprocessed_images = []
@@ -469,7 +558,7 @@ class VLAConsumerDataset(Dataset):
 
 class DataCollatorForVLAConsumerDataset(object):
     """Collate examples for supervised training.
-    🆕 支持双教师REPA的数据收集
+    🆕 支持关键时间段标签的数据收集
     """
 
     def __init__(self, tokenizer: transformers.PreTrainedTokenizer) -> None:
@@ -487,9 +576,11 @@ class DataCollatorForVLAConsumerDataset(object):
         }
         
         # 视觉特征收集
-        dinov2_images = []      # DINOv2图像
-        depth_images = []       # 🆕 DepthAnythingV2图像
-        qpos_trajectories = []  # 🆕 qpos轨迹（用于关键时间段分析）
+        dinov2_images = []
+        depth_images = []
+        
+        # 🆕 关键时间段标签收集
+        critical_labels = []
         
         # 语言特征收集
         input_ids = []
@@ -518,17 +609,17 @@ class DataCollatorForVLAConsumerDataset(object):
             batch["data_indices"].append(instance["data_idx"])
             batch["ctrl_freqs"].append(instance["ctrl_freq"])
             
-            # 🆕 收集DINOv2图像（现有）
+            # 收集DINOv2图像
             if "dinov2_images" in instance:
                 dinov2_images.append(instance["dinov2_images"])
             
-            # 🆕 收集DepthAnythingV2图像
+            # 收集DepthAnythingV2图像
             if "depth_images" in instance:
                 depth_images.append(instance["depth_images"])
             
-            # 🆕 收集qpos轨迹
-            if "qpos_trajectory" in instance and instance["qpos_trajectory"] is not None:
-                qpos_trajectories.append(instance["qpos_trajectory"])
+            # 🆕 收集关键时间段标签
+            if "critical_labels" in instance:
+                critical_labels.append(instance["critical_labels"])
 
         # 堆叠基础数据
         keys_to_stack = ["states", "actions", "state_elem_mask", "state_norm", "images"]
@@ -552,26 +643,26 @@ class DataCollatorForVLAConsumerDataset(object):
             batch["lang_embeds"] = lang_embeds
             batch["lang_attn_mask"] = input_lang_attn_mask
         
-        # 🆕 堆叠DINOv2图像（现有）
+        # 堆叠DINOv2图像
         if len(dinov2_images) > 0:
             batch["dinov2_images"] = torch.stack(dinov2_images, dim=0)
         
-        # 🆕 堆叠DepthAnythingV2图像
+        # 堆叠DepthAnythingV2图像
         if len(depth_images) > 0:
             batch["depth_images"] = torch.stack(depth_images, dim=0)
         
-        # 🆕 堆叠qpos轨迹
-        if len(qpos_trajectories) > 0:
-            # 处理可能不同长度的轨迹，填充到统一长度
-            max_len = max(traj.shape[0] for traj in qpos_trajectories)
-            padded_trajectories = []
-            for traj in qpos_trajectories:
-                if traj.shape[0] < max_len:
-                    # 用最后一帧填充
-                    padding_len = max_len - traj.shape[0]
-                    padding = traj[-1:].repeat(padding_len, 1)
-                    traj = torch.cat([traj, padding], dim=0)
-                padded_trajectories.append(traj)
-            batch["qpos_trajectory"] = torch.stack(padded_trajectories, dim=0)
+        # 🆕 堆叠关键时间段标签
+        if len(critical_labels) > 0:
+            # 处理可能不同长度的标签序列
+            max_len = max(labels.shape[0] for labels in critical_labels)
+            padded_labels = []
+            for labels in critical_labels:
+                if labels.shape[0] < max_len:
+                    # 用0填充（表示非关键时间段）
+                    padding_len = max_len - labels.shape[0]
+                    padding = torch.zeros(padding_len, dtype=labels.dtype)
+                    labels = torch.cat([labels, padding], dim=0)
+                padded_labels.append(labels)
+            batch["critical_labels"] = torch.stack(padded_labels, dim=0)
 
         return batch
