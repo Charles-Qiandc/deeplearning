@@ -9,191 +9,45 @@ from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultist
 
 from models.hub_mixin import CompatiblePyTorchModelHubMixin
 from models.rdt.model import RDT
-
-
-class ConstrainedAdaptiveWeightLearner(nn.Module):
-    """
-    基于关键时间段约束的自适应权重学习器
-    关键时间段：强制深度权重占主导，但具体比例可学习
-    非关键时间段：强制全局权重占主导，但具体比例可学习
-    """
-    
-    def __init__(self, 
-                 action_dim: int = 2048,
-                 hidden_dim: int = 512,
-                 temperature_init: float = 1.0,
-                 critical_depth_min: float = 0.6,      # 关键时间段深度权重最小值
-                 critical_depth_max: float = 0.9,      # 关键时间段深度权重最大值
-                 non_critical_global_min: float = 0.6, # 非关键时间段全局权重最小值
-                 non_critical_global_max: float = 0.9): # 非关键时间段全局权重最大值
-        super().__init__()
-        
-        # 权重预测网络：输出单个logit，用于在约束范围内调节权重
-        self.weight_predictor = nn.Sequential(
-            nn.Linear(action_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, 1),  # 只输出1个值用于权重调节
-        )
-        
-        # 可学习参数
-        self.temperature = nn.Parameter(torch.tensor(temperature_init))
-        
-        # 约束范围
-        self.critical_depth_min = critical_depth_min
-        self.critical_depth_max = critical_depth_max
-        self.non_critical_global_min = non_critical_global_min
-        self.non_critical_global_max = non_critical_global_max
-        
-        self._initialize_weights()
-        
-    def _initialize_weights(self):
-        """初始化网络权重"""
-        for module in self.weight_predictor:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight, gain=0.1)  # 小的初始化
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-    
-    def forward(self, action_tokens: torch.Tensor, routing_weights: torch.Tensor):
-        """
-        Args:
-            action_tokens: (B, T, action_dim)
-            routing_weights: (B, T, 2) 路由网络输出的软权重 [全局, 深度]
-            
-        Returns:
-            dict: 包含约束后的自适应权重
-        """
-        B, T, D = action_tokens.shape
-        device = action_tokens.device
-        dtype = action_tokens.dtype  # 使用输入张量的数据类型
-        
-        # 1. 预测权重调节参数 - 修复内存布局问题
-        flat_tokens = action_tokens.contiguous().view(B * T, D)  # 确保张量连续
-        raw_adjustment = self.weight_predictor(flat_tokens)  # (B*T, 1)
-        raw_adjustment = raw_adjustment.view(B, T)  # (B, T)
-        
-        # 2. 应用温度缩放的sigmoid，映射到 [0, 1]
-        temp = torch.clamp(self.temperature, min=0.1, max=5.0)
-        adjustment_factor = torch.sigmoid(raw_adjustment / temp)  # (B, T) ∈ [0, 1]
-        
-        # 3. 根据路由权重判断时间段类型
-        # routing_weights[:,:,1] > routing_weights[:,:,0] 表示倾向于深度专家（关键时间段）
-        depth_preference = routing_weights[:, :, 1] > routing_weights[:, :, 0]  # (B, T)
-        
-        # 4. 根据路由偏好应用不同的权重约束
-        global_weights = torch.zeros_like(adjustment_factor, dtype=dtype, device=device)  # (B, T)
-        depth_weights = torch.zeros_like(adjustment_factor, dtype=dtype, device=device)   # (B, T)
-        
-        # 深度偏好时间段：深度权重在约束范围内可学习
-        if depth_preference.any():
-            depth_pref_adjustment = adjustment_factor[depth_preference]
-            
-            # 将调节因子映射到深度权重范围 - 确保数据类型一致
-            constrained_depth_weights = (
-                torch.tensor(self.critical_depth_min, dtype=dtype, device=device) + 
-                depth_pref_adjustment * (self.critical_depth_max - self.critical_depth_min)
-            )
-            constrained_global_weights = torch.tensor(1.0, dtype=dtype, device=device) - constrained_depth_weights
-            
-            depth_weights[depth_preference] = constrained_depth_weights
-            global_weights[depth_preference] = constrained_global_weights
-        
-        # 全局偏好时间段：全局权重在约束范围内可学习
-        global_preference = ~depth_preference
-        if global_preference.any():
-            global_pref_adjustment = adjustment_factor[global_preference]
-            
-            # 将调节因子映射到全局权重范围 - 确保数据类型一致
-            constrained_global_weights = (
-                torch.tensor(self.non_critical_global_min, dtype=dtype, device=device) + 
-                global_pref_adjustment * (self.non_critical_global_max - self.non_critical_global_min)
-            )
-            constrained_depth_weights = torch.tensor(1.0, dtype=dtype, device=device) - constrained_global_weights
-            
-            global_weights[global_preference] = constrained_global_weights
-            depth_weights[global_preference] = constrained_depth_weights
-        
-        # 5. 组装最终权重
-        adaptive_weights = torch.stack([global_weights, depth_weights], dim=-1)  # (B, T, 2)
-        
-        # 6. 计算多样性损失：鼓励权重在约束范围内有所变化
-        diversity_loss = self._compute_diversity_loss(adjustment_factor, depth_preference, dtype=dtype)
-        
-        return {
-            'adaptive_weights': adaptive_weights,           # (B, T, 2)
-            'adjustment_factor': adjustment_factor,         # (B, T)
-            'diversity_loss': diversity_loss,              # 标量
-            'temperature': temp.item(),                    # 当前温度值
-            'depth_preference_ratio': depth_preference.float().mean().item(),
-        }
-    
-    def _compute_diversity_loss(self, adjustment_factor: torch.Tensor, depth_preference: torch.Tensor, dtype=None):
-        """计算多样性损失：鼓励权重在约束范围内的多样性"""
-        if dtype is None:
-            dtype = adjustment_factor.dtype
-        device = adjustment_factor.device
-        
-        diversity_loss = torch.tensor(0.0, dtype=dtype, device=device)
-        
-        if depth_preference.any():
-            depth_pref_adjustments = adjustment_factor[depth_preference]
-            if len(depth_pref_adjustments) > 1:
-                depth_var = torch.var(depth_pref_adjustments)
-                target_var = torch.tensor(0.1, dtype=dtype, device=device)
-                diversity_loss += F.mse_loss(depth_var, target_var)
-        
-        global_preference = ~depth_preference
-        if global_preference.any():
-            global_pref_adjustments = adjustment_factor[global_preference]
-            if len(global_pref_adjustments) > 1:
-                global_var = torch.var(global_pref_adjustments)
-                target_var = torch.tensor(0.1, dtype=dtype, device=device)
-                diversity_loss += F.mse_loss(global_var, target_var)
-        
-        return diversity_loss
+from models.rdt.binary_soft_routing import SimpleDualTeacherModel
 
 
 class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin, 
                repo_url="https://huggingface.co/robotics-diffusion-transformer/rdt-1b"):
     """
-    集成双教师REPA对齐损失和约束自适应权重学习的RDT运行器
+    集成软路由双教师REPA对齐损失的RDT运行器
+    
+    核心创新：
+    1. 基于关键时间段二元标签的软路由权重分配
+    2. 规则驱动的权重映射：关键时间段偏向深度，非关键时间段偏向全局
+    3. 可选的神经网络微调和时序平滑
+    4. 完整的对比学习和统计分析
     """
     def __init__(self, *, action_dim, pred_horizon, config, 
                  lang_token_dim, img_token_dim, state_token_dim, 
                  max_lang_cond_len, img_cond_len, lang_pos_embed_config=None, 
                  img_pos_embed_config=None, dtype=torch.bfloat16,
-                 # REPA相关参数
-                 enable_repa_loss=True, repa_loss_weight=0.2,
-                 # 双教师相关参数
-                 use_dual_teachers=False, routing_loss_weight=0.1,
-                 # 🆕 约束自适应权重参数
-                 enable_constrained_weights=True,
-                 constrained_weight_config=None):
+                 # 软路由双教师REPA参数
+                 enable_soft_routing_repa=True, 
+                 soft_routing_repa_weight=0.2,
+                 dinov2_feature_dim=1024,
+                 depth_feature_dim=1024,
+                 # 软路由配置
+                 soft_routing_config=None):
         super(RDTRunner, self).__init__()
         
-        # REPA损失配置
-        self.enable_repa_loss = enable_repa_loss
-        self.repa_loss_weight = repa_loss_weight
+        # 软路由双教师REPA配置
+        self.enable_soft_routing_repa = enable_soft_routing_repa
+        self.soft_routing_repa_weight = soft_routing_repa_weight
         self.dtype = dtype
+        self.dinov2_feature_dim = dinov2_feature_dim
+        self.depth_feature_dim = depth_feature_dim
         
-        # 双教师配置
-        self.use_dual_teachers = use_dual_teachers
-        self.routing_loss_weight = routing_loss_weight
-        
-        # 🆕 约束自适应权重配置
-        self.enable_constrained_weights = enable_constrained_weights
-        
-        print(f"🔧 RDTRunner初始化:")
-        print(f"   - REPA损失启用: {enable_repa_loss}")
-        print(f"   - REPA损失权重: {repa_loss_weight}")
-        print(f"   - 双教师模式: {use_dual_teachers}")
-        print(f"   - 路由损失权重: {routing_loss_weight}")
-        print(f"   - 约束自适应权重: {enable_constrained_weights}")
+        print(f"🔧 软路由双教师RDTRunner初始化:")
+        print(f"   - 软路由REPA损失启用: {enable_soft_routing_repa}")
+        print(f"   - 软路由REPA损失权重: {soft_routing_repa_weight}")
+        print(f"   - DINOv2特征维度: {dinov2_feature_dim}")
+        print(f"   - 深度特征维度: {depth_feature_dim}")
         print(f"   - 数据类型: {dtype}")
         
         # 创建扩散模型
@@ -209,10 +63,10 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
             lang_pos_embed_config=lang_pos_embed_config,
             img_pos_embed_config=img_pos_embed_config,
             dtype=dtype,
-            enable_repa_loss=enable_repa_loss,
-            use_dual_teachers=use_dual_teachers,
-            dinov2_feature_dim=1024,
-            depth_feature_dim=1024,
+            enable_repa_loss=enable_soft_routing_repa,
+            repa_activation_layer=21,  # 在第21层提取动作tokens
+            dinov2_feature_dim=dinov2_feature_dim,
+            depth_feature_dim=depth_feature_dim,
         )
 
         # 适配器创建
@@ -237,24 +91,43 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
         self.img_adaptor = self.img_adaptor.to(dtype)
         self.state_adaptor = self.state_adaptor.to(dtype)
         
-        # 🆕 约束权重学习器初始化
-        if self.enable_constrained_weights and enable_repa_loss:
-            default_config = {
+        # 🆕 创建软路由双教师对齐模型
+        if self.enable_soft_routing_repa:
+            # 设置默认软路由配置
+            default_soft_routing_config = {
                 'action_dim': hidden_size,
-                'hidden_dim': 512,
-                'temperature_init': 1.0,
-                'critical_depth_min': 0.6,
-                'critical_depth_max': 0.9,
-                'non_critical_global_min': 0.6,
-                'non_critical_global_max': 0.9,
+                'dinov2_dim': dinov2_feature_dim,
+                'depth_dim': depth_feature_dim,
+                'router_config': {
+                    'action_dim': hidden_size,
+                    'critical_global_weight': 0.25,      # 关键时间段：全局25%，深度75%
+                    'critical_depth_weight': 0.75,
+                    'non_critical_global_weight': 0.75,  # 非关键时间段：全局75%，深度25%
+                    'non_critical_depth_weight': 0.25,
+                    'enable_neural_adjustment': True,    # 启用神经网络微调
+                    'adjustment_strength': 0.1,          # 微调强度
+                    'temporal_smoothing': 0.9,           # 时序平滑系数
+                    'temperature': 1.0,                  # softmax温度
+                }
             }
-            if constrained_weight_config:
-                default_config.update(constrained_weight_config)
             
-            self.constrained_weight_config = default_config
-            self.constrained_weight_learner = None  # 延迟初始化
+            # 合并用户配置
+            if soft_routing_config:
+                default_soft_routing_config.update(soft_routing_config)
+                if 'router_config' in soft_routing_config:
+                    default_soft_routing_config['router_config'].update(soft_routing_config['router_config'])
             
-            print(f"🎯 约束权重学习器配置: {default_config}")
+            self.soft_routing_config = default_soft_routing_config
+            self.dual_teacher_model = SimpleDualTeacherModel(**default_soft_routing_config)
+            self.dual_teacher_model.to(dtype)
+            
+            print(f"🎯 软路由双教师对齐模型配置:")
+            router_config = default_soft_routing_config['router_config']
+            print(f"   - 关键时间段权重: 全局{router_config['critical_global_weight']:.2f}, 深度{router_config['critical_depth_weight']:.2f}")
+            print(f"   - 非关键时间段权重: 全局{router_config['non_critical_global_weight']:.2f}, 深度{router_config['non_critical_depth_weight']:.2f}")
+            print(f"   - 神经网络微调: {router_config['enable_neural_adjustment']}")
+            print(f"   - 时序平滑系数: {router_config['temporal_smoothing']}")
+            print(f"   - 微调强度: {router_config['adjustment_strength']}")
         
         # 噪声调度器创建
         noise_scheduler_config = config['noise_scheduler']
@@ -276,183 +149,147 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
 
         self.pred_horizon = pred_horizon
         self.action_dim = action_dim
+        
+        # 用于追踪训练状态
+        self.training_step = 0
+        self.batch_count = 0
 
         print("Diffusion params: %e" % sum(
             [p.numel() for p in self.model.parameters()] + 
             [p.numel() for p in self.lang_adaptor.parameters()] + 
             [p.numel() for p in self.img_adaptor.parameters()] + 
             [p.numel() for p in self.state_adaptor.parameters()]))
+        
+        if self.enable_soft_routing_repa:
+            dual_teacher_params = sum(p.numel() for p in self.dual_teacher_model.parameters())
+            print(f"Soft routing dual teacher params: {dual_teacher_params:e}")
 
-    def compute_constrained_dual_teacher_alignment_loss(self, action_tokens, dinov2_cls_token, 
-                                                  depth_cls_token, routing_weights, critical_labels=None):
+    def compute_soft_routing_dual_teacher_repa_loss(self, action_tokens, dinov2_cls_token, 
+                                                   depth_cls_token, critical_labels):
         """
-        基于路由网络和约束权重学习的双教师对齐损失
+        计算基于软路由的双教师REPA对齐损失
         
         Args:
             action_tokens: (B, T, hidden_size) 动作tokens
-            dinov2_cls_token: (B, 1, 1024) DINOv2全局特征
-            depth_cls_token: (B, 1024) 深度特征
-            routing_weights: (B, T, 2) 路由网络输出权重
-            critical_labels: (B, T) 关键时间段标签（可选，用于分析）
+            dinov2_cls_token: (B, 1, dinov2_dim) 或 (B, dinov2_dim) DINOv2全局特征
+            depth_cls_token: (B, depth_dim) 深度特征
+            critical_labels: (B, T) 关键时间段标签（0/1）
+        
+        Returns:
+            total_loss: 总损失
+            detailed_metrics: 详细指标字典
         """
         B, T, hidden_size = action_tokens.shape
         device = action_tokens.device
-        dtype = action_tokens.dtype  # 获取正确的数据类型
+        dtype = action_tokens.dtype
         
-        # 1. 延迟初始化约束权重学习器，确保数据类型一致
-        if self.constrained_weight_learner is None:
-            self.constrained_weight_learner = ConstrainedAdaptiveWeightLearner(
-                **self.constrained_weight_config
-            ).to(device, dtype=dtype)  # 确保权重学习器使用正确的数据类型
-            print(f"约束权重学习器已初始化，数据类型: {dtype}")
+        # 确保特征维度正确
+        if dinov2_cls_token.dim() == 3:
+            dinov2_cls_squeezed = dinov2_cls_token.squeeze(1)  # (B, dinov2_dim)
+        else:
+            dinov2_cls_squeezed = dinov2_cls_token
         
-        # 2. 投影视觉特征到动作空间
-        dinov2_cls_squeezed = dinov2_cls_token.squeeze(1) if dinov2_cls_token.dim() == 3 else dinov2_cls_token
-        depth_cls_squeezed = depth_cls_token.squeeze(1) if depth_cls_token.dim() == 3 else depth_cls_token
+        if depth_cls_token.dim() == 3:
+            depth_cls_squeezed = depth_cls_token.squeeze(1)  # (B, depth_dim)
+        else:
+            depth_cls_squeezed = depth_cls_token
         
-        projected_dinov2 = self.model.dinov2_to_action_projector(dinov2_cls_squeezed)  # (B, 2048)
-        projected_depth = self.model.depth_to_action_projector(depth_cls_squeezed)      # (B, 2048)
+        # 确保关键时间段标签类型正确
+        if critical_labels.dtype != torch.long:
+            critical_labels = critical_labels.long()
         
-        # 扩展到时间维度
-        projected_dinov2_expanded = projected_dinov2.unsqueeze(1).expand(-1, T, -1)  # (B, T, 2048)
-        projected_depth_expanded = projected_depth.unsqueeze(1).expand(-1, T, -1)    # (B, T, 2048)
+        # 判断是否为第一个batch（用于时序平滑）
+        is_first_batch = (self.batch_count == 0)
         
-        # 3. 计算基础对齐损失
-        action_norm = F.normalize(action_tokens, p=2, dim=-1)
-        dinov2_norm = F.normalize(projected_dinov2_expanded, p=2, dim=-1)
-        depth_norm = F.normalize(projected_depth_expanded, p=2, dim=-1)
-        
-        # 余弦相似度
-        global_similarity = torch.sum(action_norm * dinov2_norm, dim=-1)  # (B, T)
-        depth_similarity = torch.sum(action_norm * depth_norm, dim=-1)    # (B, T)
-        
-        # 转换为损失
-        global_loss = torch.tensor(1.0, dtype=dtype, device=device) - global_similarity  # (B, T)
-        depth_loss = torch.tensor(1.0, dtype=dtype, device=device) - depth_similarity    # (B, T)
-        
-        # 4. 获取约束后的自适应权重
-        weight_results = self.constrained_weight_learner(action_tokens, routing_weights)
-        adaptive_weights = weight_results['adaptive_weights']  # (B, T, 2)
-        diversity_loss = weight_results['diversity_loss']
-        
-        # 5. 应用约束权重加权损失
-        weighted_global_loss = adaptive_weights[:, :, 0] * global_loss  # (B, T)
-        weighted_depth_loss = adaptive_weights[:, :, 1] * depth_loss    # (B, T)
-        
-        # 主对齐损失
-        alignment_loss = (weighted_global_loss + weighted_depth_loss).mean()
-        
-        # 6. 时序平滑性正则化
-        smoothness_loss = torch.tensor(0.0, device=device, dtype=dtype)
-        if T > 1:
-            weight_diff = torch.diff(adaptive_weights, dim=1)  # (B, T-1, 2)
-            smoothness_loss = torch.mean(weight_diff ** 2)
-        
-        # 7. 总损失组合
-        total_loss = (
-            alignment_loss + 
-            torch.tensor(0.05, dtype=dtype, device=device) * diversity_loss +      # 鼓励权重多样性
-            torch.tensor(0.02, dtype=dtype, device=device) * smoothness_loss       # 时序平滑性
-        )
-        
-        # 8. 构建详细指标
-        metrics_dict = {
-            # 主要损失组件
-            'alignment_loss': alignment_loss.item(),
-            'diversity_loss': diversity_loss.item(),
-            'smoothness_loss': smoothness_loss.item(),
-            'total_constrained_loss': total_loss.item(),
+        try:
+            # 使用软路由双教师模型计算对齐损失
+            results = self.dual_teacher_model(
+                action_tokens=action_tokens,
+                dinov2_features=dinov2_cls_squeezed,
+                depth_features=depth_cls_squeezed,
+                critical_labels=critical_labels,
+                is_first_batch=is_first_batch
+            )
             
-            # 基础损失（未加权）
-            'raw_global_loss': global_loss.mean().item(),
-            'raw_depth_loss': depth_loss.mean().item(),
+            # 提取损失和统计信息
+            total_loss = results['total_loss']
             
-            # 权重学习器状态
-            'weight_temperature': weight_results['temperature'],
-            'depth_preference_ratio': weight_results['depth_preference_ratio'],
-            
-            # 权重统计
-            'constrained_avg_global_weight': adaptive_weights[:, :, 0].mean().item(),
-            'constrained_avg_depth_weight': adaptive_weights[:, :, 1].mean().item(),
-            'constrained_global_weight_std': adaptive_weights[:, :, 0].std().item(),
-            'constrained_depth_weight_std': adaptive_weights[:, :, 1].std().item(),
-            
-            # 路由权重统计（用于对比）
-            'routing_avg_global_weight': routing_weights[:, :, 0].mean().item(),
-            'routing_avg_depth_weight': routing_weights[:, :, 1].mean().item(),
-            
-            # 存储权重用于后续分析
-            'adaptive_weights_tensor': adaptive_weights.detach(),
-            'routing_weights_tensor': routing_weights.detach(),
-        }
-        
-        # 9. 如果有关键时间段标签，进行更详细的分析
-        if critical_labels is not None:
-            print(f"🔍 开始分类统计分析")
-            critical_mask = critical_labels.bool()
-            
-            print(f"🔍 critical_mask shape: {critical_mask.shape}")
-            print(f"🔍 critical_mask sum: {critical_mask.sum().item()}")
-            print(f"🔍 adaptive_weights shape: {adaptive_weights.shape}")
-            
-            if critical_mask.any():
-                critical_adaptive_weights = adaptive_weights[critical_mask]
-                critical_routing_weights = routing_weights[critical_mask]
+            # 构建详细指标
+            detailed_metrics = {
+                # 主要损失组件
+                'soft_routing_total_loss': total_loss.item(),
+                'soft_routing_alignment_loss': results['alignment_loss'].item(),
+                'soft_routing_contrastive_loss': results['contrastive_loss'].item(),
                 
-                print(f"🔍 critical_adaptive_weights shape: {critical_adaptive_weights.shape}")
-                print(f"🔍 关键时间段权重 - 全局: {critical_adaptive_weights[:, 0].mean().item():.3f}")
-                print(f"🔍 关键时间段权重 - 深度: {critical_adaptive_weights[:, 1].mean().item():.3f}")
+                # 原始损失（未加权）
+                'global_loss_raw': results['global_loss_raw'].item(),
+                'depth_loss_raw': results['depth_loss_raw'].item(),
                 
-                metrics_dict.update({
-                    'critical_constrained_global': critical_adaptive_weights[:, 0].mean().item(),
-                    'critical_constrained_depth': critical_adaptive_weights[:, 1].mean().item(),
-                    'critical_routing_global': critical_routing_weights[:, 0].mean().item(),
-                    'critical_routing_depth': critical_routing_weights[:, 1].mean().item(),
+                # 加权损失
+                'weighted_global_loss': results['weighted_global_loss'].item(),
+                'weighted_depth_loss': results['weighted_depth_loss'].item(),
+                
+                # 相似度指标
+                'global_similarity_avg': results['global_similarity_avg'].item(),
+                'depth_similarity_avg': results['depth_similarity_avg'].item(),
+                
+                # 温度参数
+                'alignment_temperature': results['alignment_temperature'],
+            }
+            
+            # 路由统计信息
+            router_stats = results['router_statistics']
+            detailed_metrics.update({
+                'critical_ratio': router_stats['critical_ratio'],
+                'avg_global_weight': router_stats['avg_global_weight'],
+                'avg_depth_weight': router_stats['avg_depth_weight'],
+                'weight_std_global': router_stats['weight_std_global'],
+                'weight_std_depth': router_stats['weight_std_depth'],
+                'routing_temperature': router_stats['temperature'],
+            })
+            
+            # 分类统计
+            if 'critical_avg_global' in router_stats:
+                detailed_metrics.update({
+                    'critical_avg_global_weight': router_stats['critical_avg_global'],
+                    'critical_avg_depth_weight': router_stats['critical_avg_depth'],
                 })
-                print(f"🔍 已添加关键时间段指标到metrics_dict")
-            else:
-                print(f"⚠️ 没有关键时间段")
             
-            non_critical_mask = ~critical_mask
-            print(f"🔍 non_critical_mask sum: {non_critical_mask.sum().item()}")
-            
-            if non_critical_mask.any():
-                non_critical_adaptive_weights = adaptive_weights[non_critical_mask]
-                non_critical_routing_weights = routing_weights[non_critical_mask]
-                
-                print(f"🔍 非关键时间段权重 - 全局: {non_critical_adaptive_weights[:, 0].mean().item():.3f}")
-                print(f"🔍 非关键时间段权重 - 深度: {non_critical_adaptive_weights[:, 1].mean().item():.3f}")
-                
-                metrics_dict.update({
-                    'non_critical_constrained_global': non_critical_adaptive_weights[:, 0].mean().item(),
-                    'non_critical_constrained_depth': non_critical_adaptive_weights[:, 1].mean().item(),
-                    'non_critical_routing_global': non_critical_routing_weights[:, 0].mean().item(),
-                    'non_critical_routing_depth': non_critical_routing_weights[:, 1].mean().item(),
+            if 'non_critical_avg_global' in router_stats:
+                detailed_metrics.update({
+                    'non_critical_avg_global_weight': router_stats['non_critical_avg_global'],
+                    'non_critical_avg_depth_weight': router_stats['non_critical_avg_depth'],
                 })
-                print(f"🔍 已添加非关键时间段指标到metrics_dict")
-                
-                # 计算路由网络与关键时间段标签的一致性
-                critical_routing_correct = (critical_routing_weights[:, 1] > critical_routing_weights[:, 0]).float().mean()
-                non_critical_routing_correct = (non_critical_routing_weights[:, 0] > non_critical_routing_weights[:, 1]).float().mean()
-                
-                metrics_dict.update({
-                    'routing_critical_accuracy': critical_routing_correct.item(),
-                    'routing_non_critical_accuracy': non_critical_routing_correct.item(),
-                    'routing_overall_accuracy': (critical_routing_correct + non_critical_routing_correct).item() / 2,
-                })
-                print(f"🔍 已添加路由准确率指标")
-            else:
-                print(f"⚠️ 没有非关键时间段")
             
-            print(f"🔍 metrics_dict keys: {list(metrics_dict.keys())}")
-                
-        return total_loss, metrics_dict
+            # 微调统计
+            if 'weight_drift' in router_stats:
+                detailed_metrics['weight_drift'] = router_stats['weight_drift']
+            
+            # 存储路由权重用于分析
+            detailed_metrics['routing_weights_tensor'] = results['routing_weights'].detach()
+            detailed_metrics['base_weights_tensor'] = results['base_weights'].detach()
+            
+            return total_loss, detailed_metrics
+            
+        except Exception as e:
+            print(f"⚠️ 软路由双教师REPA损失计算失败: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # 返回零损失和基础指标
+            zero_loss = torch.tensor(0.0, device=device, dtype=dtype)
+            fallback_metrics = {
+                'soft_routing_total_loss': 0.0,
+                'soft_routing_alignment_loss': 0.0,
+                'error': str(e),
+            }
+            return zero_loss, fallback_metrics
 
     def compute_loss(self, lang_tokens, lang_attn_mask, img_tokens, 
                      state_tokens, action_gt, action_mask, ctrl_freqs,
                      cls_token=None, depth_features=None, critical_labels=None):
         """
-        计算总损失，包括扩散损失、路由损失和约束权重对齐损失
+        计算总损失，包括扩散损失和软路由双教师REPA损失
         """
         batch_size = lang_tokens.shape[0]
         device = lang_tokens.device
@@ -493,67 +330,43 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
 
         diffusion_loss = F.mse_loss(pred, target)
         
-        # 🆕 计算约束权重双教师REPA对齐损失
+        # 🆕 计算软路由双教师REPA对齐损失
         repa_loss = torch.tensor(0.0, device=device, dtype=diffusion_loss.dtype)
-        routing_loss = torch.tensor(0.0, device=device, dtype=diffusion_loss.dtype)
         detailed_metrics = {}
         
-        if self.enable_repa_loss and 'action_tokens_for_repa' in intermediate_activations:
-            action_tokens = intermediate_activations['action_tokens_for_repa']
+        if (self.enable_soft_routing_repa and 
+            'action_tokens_for_repa' in intermediate_activations and
+            cls_token is not None and 
+            depth_features is not None and 
+            critical_labels is not None):
             
-            if self.use_dual_teachers and cls_token is not None and depth_features is not None:
-                cls_token = cls_token.to(self.dtype)
-                depth_features = depth_features.to(self.dtype)
-                
-                # 提取深度CLS token
-                if depth_features.shape[1] >= 1:
-                    depth_cls_token = depth_features[:, 0, :]  # (B, 1024)
-                else:
-                    depth_cls_token = cls_token.squeeze(1)  # Fallback
-                
-                # 获取路由权重
-                routing_weights = intermediate_activations.get('routing_weights', None)
-                
-                if routing_weights is not None:
-                    if self.enable_constrained_weights:
-                        # 🆕 使用约束权重模式
-                        repa_loss, detailed_metrics = self.compute_constrained_dual_teacher_alignment_loss(
-                            action_tokens, 
-                            cls_token,       
-                            depth_cls_token, 
-                            routing_weights,
-                            critical_labels
-                        )
-                    else:
-                        # 原始双教师模式
-                        repa_loss, routing_loss, loss_dict = self.compute_dual_teacher_alignment_loss(
-                            action_tokens, 
-                            cls_token,       
-                            depth_cls_token, 
-                            routing_weights,
-                            critical_labels
-                        )
-                        detailed_metrics = loss_dict
-                    
-                    # 路由损失（监督路由网络学习）
-                    if critical_labels is not None:
-                        target_routing = torch.zeros_like(routing_weights)
-                        target_routing[:, :, 0] = 1 - critical_labels.float()  # 全局专家权重
-                        target_routing[:, :, 1] = critical_labels.float()      # 深度专家权重
-                        
-                        routing_loss = F.binary_cross_entropy(routing_weights, target_routing, reduction='mean')
-                        detailed_metrics['routing_supervision_loss'] = routing_loss.item()
+            action_tokens = intermediate_activations['action_tokens_for_repa']
+            cls_token = cls_token.to(self.dtype)
+            depth_features = depth_features.to(self.dtype)
+            
+            # 提取深度CLS token
+            if depth_features.shape[1] >= 1:
+                depth_cls_token = depth_features[:, 0, :]  # (B, depth_dim)
+            else:
+                depth_cls_token = cls_token.squeeze(1) if cls_token.dim() == 3 else cls_token
+            
+            # 计算软路由双教师对齐损失
+            repa_loss, detailed_metrics = self.compute_soft_routing_dual_teacher_repa_loss(
+                action_tokens=action_tokens,
+                dinov2_cls_token=cls_token,
+                depth_cls_token=depth_cls_token,
+                critical_labels=critical_labels
+            )
         
         # 总损失
-        total_loss = (
-            diffusion_loss + 
-            self.repa_loss_weight * repa_loss + 
-            self.routing_loss_weight * routing_loss
-        )
+        total_loss = diffusion_loss + self.soft_routing_repa_weight * repa_loss
         
-        return total_loss, diffusion_loss, repa_loss, routing_loss, detailed_metrics
+        # 更新训练状态
+        self.training_step += 1
+        self.batch_count += 1
+        
+        return total_loss, diffusion_loss, repa_loss, detailed_metrics
 
-    # 其他方法保持不变...
     def conditional_sample(self, lang_cond, lang_attn_mask, img_cond, state_traj, action_mask, ctrl_freqs):
         """推理时的条件采样，不涉及对齐机制"""
         device = state_traj.device
@@ -624,6 +437,33 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
         )
         
         return action_pred
+
+    def reset_batch_count(self):
+        """重置batch计数器（用于新epoch）"""
+        self.batch_count = 0
+
+    def get_soft_routing_statistics(self):
+        """获取软路由统计信息"""
+        if not self.enable_soft_routing_repa:
+            return {}
+        
+        stats = {
+            'training_step': self.training_step,
+            'batch_count': self.batch_count,
+            'soft_routing_config': self.soft_routing_config,
+        }
+        
+        # 如果有路由器，获取其统计信息
+        if hasattr(self.dual_teacher_model, 'soft_router'):
+            router = self.dual_teacher_model.soft_router
+            stats.update({
+                'routing_temperature': router.temperature.item(),
+                'enable_neural_adjustment': router.enable_neural_adjustment,
+                'temporal_smoothing': router.temporal_smoothing,
+                'adjustment_strength': router.adjustment_strength,
+            })
+        
+        return stats
 
     def forward(self, *args, **kwargs) -> torch.Tensor:
         """保持兼容性，只返回总损失"""
