@@ -1,4 +1,3 @@
-
 import copy
 import logging
 import math
@@ -25,11 +24,11 @@ from models.rdt_runner import RDTRunner
 from train.dataset import DataCollatorForVLAConsumerDataset, VLAConsumerDataset
 from train.sample import log_sample_res
 
-# 🆕 导入DINOv2和DepthAnythingV2编码器
+# 导入DINOv2和DepthAnythingV2编码器
 from models.multimodal_encoder.dinov2_encoder import create_dinov2_encoder
 from models.multimodal_encoder.depth_encoder import create_depth_encoder
 
-# 🆕 导入关键时间段标注器
+# 导入关键时间段标注器
 from data.critical_timestep_annotator import TaskType
 
 if is_wandb_available():
@@ -89,6 +88,39 @@ with advanced soft routing multi-modal alignment strategies.
 """
     with open(os.path.join(repo_folder, "README.md"), "w") as f:
         f.write(yaml_header + model_card)
+
+
+def check_critical_alerts(metrics, global_step, logger):
+    """
+    检查关键异常情况并发出预警
+    """
+    alerts = []
+    
+    # 1. 特征对齐失效
+    if metrics.get('global_similarity', 1.0) < 0.3 and global_step > 1000:
+        alerts.append("WARNING: Low global similarity - feature alignment may be failing")
+    
+    # 2. 权重分配严重偏离
+    if 'critical_global_weight' in metrics:
+        expected_critical_global = 0.25
+        actual = metrics['critical_global_weight']
+        if abs(actual - expected_critical_global) > 0.2:  # 偏离超过20%
+            alerts.append(f"WARNING: Critical weight deviation - expected {expected_critical_global}, got {actual:.3f}")
+    
+    # 3. 权重调整过度
+    if metrics.get('weight_drift', 0) > 0.15:
+        alerts.append("WARNING: Excessive weight drift - neural adjustment may be too aggressive")
+    
+    # 4. 数据不平衡
+    critical_ratio = metrics.get('critical_ratio', 0.3)
+    if critical_ratio < 0.1 or critical_ratio > 0.6:
+        alerts.append(f"WARNING: Critical ratio imbalance - {critical_ratio:.3f}")
+    
+    # 记录警告
+    for alert in alerts:
+        logger.warning(alert)
+    
+    return alerts
 
 
 def train(args, logger):
@@ -153,31 +185,27 @@ def train(args, logger):
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
-    # 🆕 获取软路由双教师REPA和关键时间段标注配置
+    # 获取软路由双教师REPA和关键时间段标注配置
     enable_soft_routing_repa = model_config.get("enable_soft_routing_repa", True)
     soft_routing_repa_weight = model_config.get("soft_routing_repa_weight", 0.2)
     use_dinov2_features = model_config.get("use_dinov2_features", True)
     use_depth_features = model_config.get("use_depth_features", True)
     
-    # 🆕 关键时间段标注配置
+    # 关键时间段标注配置
     enable_critical_annotation = model_config.get("enable_critical_annotation", True)
     task_type = model_config.get("task_type", 1)  # 1=抓取类, 2=点击类
     critical_annotation_config = model_config.get("critical_annotation_config", {})
     
-    # 🆕 软路由配置
+    # 软路由配置
     soft_routing_config = model_config.get("soft_routing_config", {})
     
-    logger.info(f"🔧 软路由双教师REPA + 关键时间段标注配置:")
-    logger.info(f"   - 软路由REPA损失启用: {enable_soft_routing_repa}")
-    logger.info(f"   - 软路由REPA损失权重: {soft_routing_repa_weight}")
-    logger.info(f"   - 使用DINOv2特征: {use_dinov2_features}")
-    logger.info(f"   - 使用深度特征: {use_depth_features}")
-    logger.info(f"   - 关键时间段标注: {enable_critical_annotation}")
-    logger.info(f"   - 任务类型: {TaskType(task_type).name} ({task_type})")
-    if critical_annotation_config:
-        logger.info(f"   - 标注配置: {critical_annotation_config}")
-    if soft_routing_config:
-        logger.info(f"   - 软路由配置: {soft_routing_config}")
+    logger.info(f"Soft Routing Dual-Teacher REPA Configuration:")
+    logger.info(f"   - REPA Loss Enabled: {enable_soft_routing_repa}")
+    logger.info(f"   - REPA Loss Weight: {soft_routing_repa_weight}")
+    logger.info(f"   - Use DINOv2 Features: {use_dinov2_features}")
+    logger.info(f"   - Use Depth Features: {use_depth_features}")
+    logger.info(f"   - Critical Annotation: {enable_critical_annotation}")
+    logger.info(f"   - Task Type: {TaskType(task_type).name} ({task_type})")
 
     # 文本编码器
     if args.precomp_lang_embed:
@@ -194,18 +222,18 @@ def train(args, logger):
     vision_encoder = SiglipVisionTower(vision_tower=args.pretrained_vision_encoder_name_or_path, args=None)
     image_processor = vision_encoder.image_processor
 
-    # 🆕 创建DINOv2编码器（全局语义特征）
+    # 创建DINOv2编码器（全局语义特征）
     dinov2_encoder = None
     if use_dinov2_features and enable_soft_routing_repa:
-        logger.info("🔧 加载DINOv2编码器（全局语义教师）...")
+        logger.info("Loading DINOv2 encoder (Global Semantic Teacher)...")
         dinov2_encoder = create_dinov2_encoder(model_size="large", select_feature="cls_only")
         dinov2_encoder.to(accelerator.device, dtype=weight_dtype)
         dinov2_encoder.print_model_info()
 
-    # 🆕 创建DepthAnythingV2编码器（深度几何特征）
+    # 创建DepthAnythingV2编码器（深度几何特征）
     depth_encoder = None
     if use_depth_features and enable_soft_routing_repa:
-        logger.info("🔧 加载DepthAnythingV2编码器（深度几何教师）...")
+        logger.info("Loading DepthAnythingV2 encoder (Depth Geometric Teacher)...")
         depth_encoder = create_depth_encoder(
             model_size="metric_large",
             feature_dim=1024,
@@ -216,7 +244,7 @@ def train(args, logger):
         depth_encoder.print_model_info()
 
     # 构建RDT模型
-    logger.info("🔧 构建软路由双教师RDT模型...")
+    logger.info("Building Soft Routing Dual-Teacher RDT Model...")
     img_cond_len = (config["common"]["img_history_size"] * config["common"]["num_cameras"] *
                     vision_encoder.num_patches)
     
@@ -244,13 +272,13 @@ def train(args, logger):
         soft_routing_repa_weight=soft_routing_repa_weight,
         dinov2_feature_dim=1024,
         depth_feature_dim=1024,
-        # 🆕 软路由配置
+        # 软路由配置
         soft_routing_config=soft_routing_config,
     )
     
     # 加载预训练权重（如果提供）
     if args.pretrained_model_name_or_path and os.path.isfile(args.pretrained_model_name_or_path):
-        logger.info(f"📥 加载预训练权重: {args.pretrained_model_name_or_path}")
+        logger.info(f"Loading pretrained weights: {args.pretrained_model_name_or_path}")
         ckpt = torch.load(args.pretrained_model_name_or_path, map_location="cpu")
 
         if isinstance(ckpt, dict) and "module" in ckpt:
@@ -266,12 +294,12 @@ def train(args, logger):
             if k in own_sd and v.shape == own_sd[k].shape:
                 filtered[k] = v
             else:
-                logger.debug(f"跳过参数 {k}: checkpoint {tuple(v.shape)} vs model {tuple(own_sd.get(k, v).shape)}")
+                logger.debug(f"Skipping parameter {k}: checkpoint {tuple(v.shape)} vs model {tuple(own_sd.get(k, v).shape)}")
 
         rdt.load_state_dict(filtered, strict=False)
-        logger.info("✅ 加载匹配的预训练权重；其余保持随机初始化")
+        logger.info("Loaded matching pretrained weights; others remain randomly initialized")
     else:
-        logger.info("🎲 仅使用配置；跳过预训练权重加载")
+        logger.info("Only using config; skipping pretrained weight loading")
 
     # EMA模型
     ema_rdt = copy.deepcopy(rdt)
@@ -324,7 +352,7 @@ def train(args, logger):
         eps=args.adam_epsilon,
     )
 
-    # 🆕 数据集和数据加载器（集成关键时间段标注）
+    # 数据集和数据加载器（集成关键时间段标注）
     train_dataset = VLAConsumerDataset(
         model_config_path=args.model_config_path,
         config=config["dataset"],
@@ -341,7 +369,7 @@ def train(args, logger):
         use_precomp_lang_embed=args.precomp_lang_embed,
         use_dinov2_features=use_dinov2_features,
         use_depth_features=use_depth_features,
-        # 🆕 关键时间段标注参数
+        # 关键时间段标注参数
         task_type=task_type,
         enable_critical_annotation=enable_critical_annotation,
         critical_annotation_config=critical_annotation_config,
@@ -363,7 +391,7 @@ def train(args, logger):
         use_precomp_lang_embed=args.precomp_lang_embed,
         use_dinov2_features=use_dinov2_features,
         use_depth_features=use_depth_features,
-        # 🆕 关键时间段标注参数（采样时也启用）
+        # 关键时间段标注参数（采样时也启用）
         task_type=task_type,
         enable_critical_annotation=enable_critical_annotation,
         critical_annotation_config=critical_annotation_config,
@@ -448,16 +476,15 @@ def train(args, logger):
     # 训练信息
     total_batch_size = (args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps)
 
-    logger.info("***** 开始软路由双教师REPA + 关键时间段标注训练 *****")
-    logger.info(f"  样本数量 = {len(train_dataset)}")
-    logger.info(f"  每epoch批次数 = {len(train_dataloader)}")
-    logger.info(f"  Epoch数 = {args.num_train_epochs}")
-    logger.info(f"  每设备瞬时批次大小 = {args.train_batch_size}")
-    logger.info(f"  总训练批次大小 = {total_batch_size}")
-    logger.info(f"  梯度累积步数 = {args.gradient_accumulation_steps}")
-    logger.info(f"  总优化步数 = {args.max_train_steps}")
-    logger.info(f"  任务类型 = {TaskType(task_type).name}")
-    logger.info(f"  软路由策略 = 规则驱动 + 可选神经网络微调")
+    logger.info("***** Starting Soft Routing Dual-Teacher REPA Training *****")
+    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num Epochs = {args.num_train_epochs}")
+    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
+    logger.info(f"  Total train batch size = {total_batch_size}")
+    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    logger.info(f"  Task Type = {TaskType(task_type).name}")
+    logger.info(f"  Routing Strategy = Rule-driven + Optional Neural Adjustment")
     
     global_step = 0
     first_epoch = 0
@@ -473,14 +500,14 @@ def train(args, logger):
             path = dirs[-1] if len(dirs) > 0 else None
 
         if path is None:
-            accelerator.print(f"检查点 '{args.resume_from_checkpoint}' 不存在。开始新的训练。")
+            accelerator.print(f"Checkpoint '{args.resume_from_checkpoint}' not found. Starting new training.")
             args.resume_from_checkpoint = None
         else:
-            accelerator.print(f"从检查点恢复: {path}")
+            accelerator.print(f"Resuming from checkpoint: {path}")
             try:
                 accelerator.load_state(os.path.join(args.output_dir, path))
             except:
-                logger.info("恢复训练状态失败。尝试仅加载模型检查点。")
+                logger.info("Failed to restore training state. Trying to load model checkpoint only.")
                 checkpoint = torch.load(
                     os.path.join(args.output_dir, path, "pytorch_model", "mp_rank_00_model_states.pt"))
                 rdt.module.load_state_dict(checkpoint["module"])
@@ -499,23 +526,17 @@ def train(args, logger):
     )
     progress_bar.set_description("Steps")
 
-    # 🆕 用于记录软路由统计的变量
+    # 精简版统计变量
     soft_routing_stats = {
         'total_samples': 0,
         'critical_timesteps': 0,
-        'weight_allocation_accuracy': 0.0,
-        'weight_allocation_count': 0,
-        'cumulative_weight_drift': 0.0,
-        'temporal_smoothing_effect': 0.0,
     }
-    
-    loss_for_log = {}
     
     # 训练循环
     for epoch in range(first_epoch, args.num_train_epochs):
         rdt.train()
         
-        # 🆕 每个epoch开始时重置batch计数
+        # 每个epoch开始时重置batch计数
         accelerator.unwrap_model(rdt).reset_batch_count()
 
         if args.resume_from_checkpoint and epoch == first_epoch:
@@ -530,12 +551,12 @@ def train(args, logger):
                 state_elem_mask = batch["state_elem_mask"].to(dtype=weight_dtype)
                 ctrl_freqs = batch["ctrl_freqs"]
 
-                # 🆕 获取关键时间段标签
+                # 获取关键时间段标签
                 critical_labels = batch.get("critical_labels", None)
                 if critical_labels is not None:
                     critical_labels = critical_labels.to(accelerator.device)
                     
-                    # 统计关键时间段信息
+                    # 精简版统计
                     batch_size, seq_len = critical_labels.shape
                     soft_routing_stats['total_samples'] += batch_size * seq_len
                     soft_routing_stats['critical_timesteps'] += critical_labels.sum().item()
@@ -552,7 +573,7 @@ def train(args, logger):
                                  else text_encoder(input_ids=batch["input_ids"], 
                                                  attention_mask=lang_attn_mask)["last_hidden_state"].detach())
 
-                # 🆕 提取DINOv2全局语义特征
+                # 提取DINOv2全局语义特征
                 cls_token = None
                 if dinov2_encoder is not None and "dinov2_images" in batch:
                     with torch.no_grad():
@@ -560,7 +581,7 @@ def train(args, logger):
                         dinov2_input = dinov2_images[:, 0]  # (B, 3, 518, 518)
                         cls_token = dinov2_encoder(dinov2_input)  # (B, 1, 1024)
 
-                # 🆕 提取DepthAnythingV2深度几何特征
+                # 提取DepthAnythingV2深度几何特征
                 depth_features = None
                 if depth_encoder is not None and "depth_images" in batch:
                     with torch.no_grad():
@@ -568,7 +589,7 @@ def train(args, logger):
                         depth_input = depth_images[:, 0]  # (B, 3, 518, 518)
                         depth_features, _ = depth_encoder(depth_input)  # (B, 1370, 1024)
 
-                # 🆕 计算软路由双教师REPA损失
+                # 计算软路由双教师REPA损失
                 state_elem_mask = state_elem_mask.unsqueeze(1)
                 if enable_soft_routing_repa:
                     total_loss, diffusion_loss, repa_loss, detailed_metrics = accelerator.unwrap_model(rdt).compute_loss(
@@ -581,67 +602,46 @@ def train(args, logger):
                         ctrl_freqs=ctrl_freqs,
                         cls_token=cls_token,              
                         depth_features=depth_features,   
-                        critical_labels=critical_labels,  # 传入关键时间段标签
+                        critical_labels=critical_labels,
                     )
                     loss = total_loss
                     
-                    # 🆕 记录软路由的详细损失
-                    loss_for_log["diffusion_loss"] = diffusion_loss.detach().item()
-                    loss_for_log["soft_routing_repa_loss"] = repa_loss.detach().item()
+                    # ========================================
+                    # 精简版指标收集 - 只保留14个核心指标
+                    # ========================================
+                    loss_for_log = {
+                        # 核心损失 (4个)
+                        "diffusion_loss": diffusion_loss.detach().item(),
+                        "repa_loss": repa_loss.detach().item(),
+                        "alignment_loss": detailed_metrics.get('soft_routing_alignment_loss', 0.0),
+                        
+                        # 性能指标 (2个)  
+                        'global_similarity': detailed_metrics.get('global_similarity_avg', 0.0),
+                        'depth_similarity': detailed_metrics.get('depth_similarity_avg', 0.0),
+                        
+                        # 路由健康度 (7个)
+                        'critical_ratio': detailed_metrics.get('critical_ratio', 0.0),
+                        'avg_global_weight': detailed_metrics.get('avg_global_weight', 0.5),
+                        'avg_depth_weight': detailed_metrics.get('avg_depth_weight', 0.5),
+                    }
                     
-                    # 🆕 记录软路由的详细指标
-                    if detailed_metrics:
-                        # 主要损失组件
+                    # 分类权重 (只在有数据时添加)
+                    if 'critical_avg_global_weight' in detailed_metrics:
                         loss_for_log.update({
-                            'soft_routing_total_loss': detailed_metrics.get('soft_routing_total_loss', 0.0),
-                            'soft_routing_alignment_loss': detailed_metrics.get('soft_routing_alignment_loss', 0.0),
-                            'soft_routing_contrastive_loss': detailed_metrics.get('soft_routing_contrastive_loss', 0.0),
-                            
-                            # 原始损失（未加权）
-                            'global_loss_raw': detailed_metrics.get('global_loss_raw', 0.0),
-                            'depth_loss_raw': detailed_metrics.get('depth_loss_raw', 0.0),
-                            
-                            # 加权损失
-                            'weighted_global_loss': detailed_metrics.get('weighted_global_loss', 0.0),
-                            'weighted_depth_loss': detailed_metrics.get('weighted_depth_loss', 0.0),
-                            
-                            # 相似度指标
-                            'global_similarity_avg': detailed_metrics.get('global_similarity_avg', 0.0),
-                            'depth_similarity_avg': detailed_metrics.get('depth_similarity_avg', 0.0),
-                            
-                            # 路由权重统计
-                            'critical_ratio': detailed_metrics.get('critical_ratio', 0.0),
-                            'avg_global_weight': detailed_metrics.get('avg_global_weight', 0.5),
-                            'avg_depth_weight': detailed_metrics.get('avg_depth_weight', 0.5),
-                            'weight_std_global': detailed_metrics.get('weight_std_global', 0.0),
-                            'weight_std_depth': detailed_metrics.get('weight_std_depth', 0.0),
-                            
-                            # 温度参数
-                            'alignment_temperature': detailed_metrics.get('alignment_temperature', 0.07),
-                            'routing_temperature': detailed_metrics.get('routing_temperature', 1.0),
+                            'critical_global_weight': detailed_metrics['critical_avg_global_weight'],
+                            'critical_depth_weight': detailed_metrics['critical_avg_depth_weight'],
                         })
-                        
-                        # 分类统计
-                        if 'critical_avg_global_weight' in detailed_metrics:
-                            loss_for_log.update({
-                                'critical_avg_global_weight': detailed_metrics['critical_avg_global_weight'],
-                                'critical_avg_depth_weight': detailed_metrics['critical_avg_depth_weight'],
-                            })
-                        
-                        if 'non_critical_avg_global_weight' in detailed_metrics:
-                            loss_for_log.update({
-                                'non_critical_avg_global_weight': detailed_metrics['non_critical_avg_global_weight'],
-                                'non_critical_avg_depth_weight': detailed_metrics['non_critical_avg_depth_weight'],
-                            })
-                        
-                        # 微调统计
-                        if 'weight_drift' in detailed_metrics:
-                            loss_for_log['weight_drift'] = detailed_metrics['weight_drift']
-                            soft_routing_stats['cumulative_weight_drift'] += detailed_metrics['weight_drift']
-                        
-                        # 更新累积统计
-                        if 'critical_ratio' in detailed_metrics:
-                            soft_routing_stats['weight_allocation_count'] += 1
+                    
+                    if 'non_critical_avg_global_weight' in detailed_metrics:
+                        loss_for_log.update({
+                            'non_critical_global_weight': detailed_metrics['non_critical_avg_global_weight'],
+                            'non_critical_depth_weight': detailed_metrics['non_critical_avg_depth_weight'],
+                        })
+                    
+                    # 权重调整指标 (可选，第14个指标)
+                    if 'weight_drift' in detailed_metrics:
+                        loss_for_log['weight_drift'] = detailed_metrics['weight_drift']
+                    
                 else:
                     # 原始方式（兼容性）
                     loss = rdt(
@@ -653,7 +653,7 @@ def train(args, logger):
                         action_mask=state_elem_mask,
                         ctrl_freqs=ctrl_freqs,
                     )
-                    loss_for_log["diffusion_loss"] = loss.detach().item()
+                    loss_for_log = {"diffusion_loss": loss.detach().item()}
 
                 # 反向传播
                 accelerator.backward(loss)
@@ -677,85 +677,43 @@ def train(args, logger):
                     accelerator.save_state(save_path)
                     ema_save_path = os.path.join(save_path, f"ema")
                     accelerator.save_model(ema_rdt, ema_save_path)
-                    logger.info(f"保存状态到 {save_path}")
+                    logger.info(f"Saved state to {save_path}")
 
-                # 每100步记录软路由统计信息
-                if global_step % 100 == 0 and detailed_metrics and 'routing_weights_tensor' in detailed_metrics:
-                    routing_weights = detailed_metrics['routing_weights_tensor']  # (B, T, 2)
-                    base_weights = detailed_metrics['base_weights_tensor']       # (B, T, 2)
+                # ========================================
+                # 精简版监控 - 减少日志频率，聚焦核心指标
+                # ========================================
+                
+                # 每500步：核心指标监控
+                if global_step % 500 == 0 and enable_soft_routing_repa:
+                    logger.info(f"Step {global_step} - Core Metrics:")
+                    logger.info(f"  Losses: diffusion={loss_for_log.get('diffusion_loss', 0):.4f}, "
+                               f"repa={loss_for_log.get('repa_loss', 0):.4f}")
                     
-                    logger.info(f"软路由权重分配统计 (步骤 {global_step}):")
-                    logger.info(f"   - 基础权重: 全局={base_weights[:, :, 0].mean():.3f}, 深度={base_weights[:, :, 1].mean():.3f}")
-                    logger.info(f"   - 最终权重: 全局={routing_weights[:, :, 0].mean():.3f}, 深度={routing_weights[:, :, 1].mean():.3f}")
-                    logger.info(f"   - 权重标准差: 全局={routing_weights[:, :, 0].std():.3f}, 深度={routing_weights[:, :, 1].std():.3f}")
-                    
-                    if critical_labels is not None:
-                        critical_mask = critical_labels.bool()
-                        if critical_mask.any():
-                            critical_weights = routing_weights[critical_mask]
-                            logger.info(f"   - 关键时间段权重: 全局={critical_weights[:, 0].mean():.3f}, 深度={critical_weights[:, 1].mean():.3f}")
+                    if 'global_similarity' in loss_for_log:
+                        logger.info(f"  Alignment Quality: global_sim={loss_for_log['global_similarity']:.3f}, "
+                                   f"depth_sim={loss_for_log['depth_similarity']:.3f}")
+                        logger.info(f"  Routing Health: critical_ratio={loss_for_log['critical_ratio']:.3f}, "
+                                   f"avg_weights=[{loss_for_log['avg_global_weight']:.3f}, "
+                                   f"{loss_for_log['avg_depth_weight']:.3f}]")
                         
-                        non_critical_mask = ~critical_mask
-                        if non_critical_mask.any():
-                            non_critical_weights = routing_weights[non_critical_mask]
-                            logger.info(f"   - 非关键时间段权重: 全局={non_critical_weights[:, 0].mean():.3f}, 深度={non_critical_weights[:, 1].mean():.3f}")
-                    
-                    # 计算权重分配准确性（基于预期的规则）
-                    if critical_labels is not None:
-                        expected_critical_global = 0.25
-                        expected_critical_depth = 0.75
-                        expected_non_critical_global = 0.75
-                        expected_non_critical_depth = 0.25
+                        # 权重分配详情
+                        if 'critical_global_weight' in loss_for_log:
+                            logger.info(f"  Critical Weights: [{loss_for_log['critical_global_weight']:.3f}, "
+                                       f"{loss_for_log['critical_depth_weight']:.3f}] "
+                                       f"(expected [0.25, 0.75])")
                         
-                        if critical_mask.any():
-                            critical_global_error = abs(critical_weights[:, 0].mean().item() - expected_critical_global)
-                            critical_depth_error = abs(critical_weights[:, 1].mean().item() - expected_critical_depth)
-                            logger.info(f"   - 关键时间段权重误差: 全局={critical_global_error:.3f}, 深度={critical_depth_error:.3f}")
+                        if 'non_critical_global_weight' in loss_for_log:
+                            logger.info(f"  Non-Critical Weights: [{loss_for_log['non_critical_global_weight']:.3f}, "
+                                       f"{loss_for_log['non_critical_depth_weight']:.3f}] "
+                                       f"(expected [0.75, 0.25])")
                         
-                        if non_critical_mask.any():
-                            non_critical_global_error = abs(non_critical_weights[:, 0].mean().item() - expected_non_critical_global)
-                            non_critical_depth_error = abs(non_critical_weights[:, 1].mean().item() - expected_non_critical_depth)
-                            logger.info(f"   - 非关键时间段权重误差: 全局={non_critical_global_error:.3f}, 深度={non_critical_depth_error:.3f}")
+                        if 'weight_drift' in loss_for_log:
+                            logger.info(f"  Weight Drift: {loss_for_log['weight_drift']:.4f}")
                     
-                    # 计算总体统计
+                    # 总体统计
                     if soft_routing_stats['total_samples'] > 0:
                         overall_critical_ratio = soft_routing_stats['critical_timesteps'] / soft_routing_stats['total_samples']
-                        logger.info(f"   - 总体关键时间段比例: {overall_critical_ratio:.3f}")
-                    
-                    if soft_routing_stats['weight_allocation_count'] > 0:
-                        avg_weight_drift = soft_routing_stats['cumulative_weight_drift'] / soft_routing_stats['weight_allocation_count']
-                        logger.info(f"   - 平均权重漂移: {avg_weight_drift:.4f}")
-
-                # 每1000步打印更详细的软路由分析
-                if global_step % 1000 == 0 and detailed_metrics:
-                    logger.info(f"详细软路由分析 (步骤 {global_step}):")
-                    
-                    # 损失组件分析
-                    logger.info(f"   损失组件:")
-                    logger.info(f"     - 对齐损失: {detailed_metrics.get('soft_routing_alignment_loss', 0.0):.4f}")
-                    logger.info(f"     - 对比损失: {detailed_metrics.get('soft_routing_contrastive_loss', 0.0):.4f}")
-                    logger.info(f"     - 原始全局损失: {detailed_metrics.get('global_loss_raw', 0.0):.4f}")
-                    logger.info(f"     - 原始深度损失: {detailed_metrics.get('depth_loss_raw', 0.0):.4f}")
-                    logger.info(f"     - 加权全局损失: {detailed_metrics.get('weighted_global_loss', 0.0):.4f}")
-                    logger.info(f"     - 加权深度损失: {detailed_metrics.get('weighted_depth_loss', 0.0):.4f}")
-                    
-                    # 相似度分析
-                    logger.info(f"   特征相似度:")
-                    logger.info(f"     - 全局相似度: {detailed_metrics.get('global_similarity_avg', 0.0):.4f}")
-                    logger.info(f"     - 深度相似度: {detailed_metrics.get('depth_similarity_avg', 0.0):.4f}")
-                    
-                    # 温度参数分析
-                    logger.info(f"   温度参数:")
-                    logger.info(f"     - 对齐温度: {detailed_metrics.get('alignment_temperature', 0.07):.4f}")
-                    logger.info(f"     - 路由温度: {detailed_metrics.get('routing_temperature', 1.0):.4f}")
-                    
-                    # 软路由统计信息
-                    soft_routing_model_stats = accelerator.unwrap_model(rdt).get_soft_routing_statistics()
-                    if soft_routing_model_stats:
-                        logger.info(f"   软路由模型状态:")
-                        logger.info(f"     - 神经网络微调: {soft_routing_model_stats.get('enable_neural_adjustment', False)}")
-                        logger.info(f"     - 时序平滑系数: {soft_routing_model_stats.get('temporal_smoothing', 0.0):.2f}")
-                        logger.info(f"     - 微调强度: {soft_routing_model_stats.get('adjustment_strength', 0.0):.3f}")
+                        logger.info(f"  Overall Critical Ratio: {overall_critical_ratio:.3f}")
 
                 if args.sample_period > 0 and global_step % args.sample_period == 0:
                     sample_loss_for_log = log_sample_res(
@@ -772,50 +730,41 @@ def train(args, logger):
                     logger.info(sample_loss_for_log)
                     accelerator.log(sample_loss_for_log, step=global_step)
 
-            # 记录日志
+            # 记录日志 - 只记录核心指标
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-            progress_bar.set_postfix(**logs)
             logs.update(loss_for_log)
             accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
                 break
 
-    # 训练结束时的软路由统计总结
+    # 训练结束时的精简统计总结
     if accelerator.is_main_process:
-        logger.info("训练完成 - 软路由权重分配统计总结:")
+        logger.info("Training Complete - Final Summary:")
         
         if soft_routing_stats['total_samples'] > 0:
             final_critical_ratio = soft_routing_stats['critical_timesteps'] / soft_routing_stats['total_samples']
-            logger.info(f"   - 处理的总时间步数: {soft_routing_stats['total_samples']}")
-            logger.info(f"   - 关键时间步数: {soft_routing_stats['critical_timesteps']}")
-            logger.info(f"   - 最终关键时间段比例: {final_critical_ratio:.3f}")
-        
-        if soft_routing_stats['weight_allocation_count'] > 0:
-            final_avg_weight_drift = soft_routing_stats['cumulative_weight_drift'] / soft_routing_stats['weight_allocation_count']
-            logger.info(f"   - 平均权重漂移: {final_avg_weight_drift:.4f}")
+            logger.info(f"  Total Timesteps Processed: {soft_routing_stats['total_samples']}")
+            logger.info(f"  Critical Timesteps: {soft_routing_stats['critical_timesteps']}")
+            logger.info(f"  Final Critical Ratio: {final_critical_ratio:.3f}")
         
         # 获取最终的软路由配置
         final_soft_routing_stats = accelerator.unwrap_model(rdt).get_soft_routing_statistics()
         if final_soft_routing_stats:
-            logger.info(f"   - 最终路由温度: {final_soft_routing_stats.get('routing_temperature', 1.0):.4f}")
-            logger.info(f"   - 神经网络微调启用: {final_soft_routing_stats.get('enable_neural_adjustment', False)}")
-            logger.info(f"   - 时序平滑系数: {final_soft_routing_stats.get('temporal_smoothing', 0.0):.2f}")
+            logger.info(f"  Final Routing Temperature: {final_soft_routing_stats.get('routing_temperature', 1.0):.4f}")
+            logger.info(f"  Neural Adjustment Enabled: {final_soft_routing_stats.get('enable_neural_adjustment', False)}")
+            logger.info(f"  Temporal Smoothing: {final_soft_routing_stats.get('temporal_smoothing', 0.0):.2f}")
 
-        # 保存训练配置和统计信息
+        # 保存精简版训练配置
         final_config = {
             'task_type': task_type,
             'task_name': TaskType(task_type).name,
             'enable_critical_annotation': enable_critical_annotation,
-            'critical_annotation_config': critical_annotation_config,
             'enable_soft_routing_repa': enable_soft_routing_repa,
-            'soft_routing_config': soft_routing_config,
             'final_statistics': {
                 'total_timesteps': soft_routing_stats['total_samples'],
                 'critical_timesteps': soft_routing_stats['critical_timesteps'],
                 'critical_ratio': soft_routing_stats['critical_timesteps'] / soft_routing_stats['total_samples'] if soft_routing_stats['total_samples'] > 0 else 0.0,
-                'avg_weight_drift': soft_routing_stats['cumulative_weight_drift'] / soft_routing_stats['weight_allocation_count'] if soft_routing_stats['weight_allocation_count'] > 0 else 0.0,
-                'weight_allocation_batches': soft_routing_stats['weight_allocation_count'],
             },
             'training_hyperparameters': {
                 'soft_routing_repa_weight': soft_routing_repa_weight,
@@ -830,7 +779,7 @@ def train(args, logger):
         with open(os.path.join(args.output_dir, "soft_routing_training_config.json"), "w") as f:
             json.dump(final_config, f, indent=2)
         
-        logger.info(f"软路由训练配置已保存到: {os.path.join(args.output_dir, 'soft_routing_training_config.json')}")
+        logger.info(f"Training config saved to: {os.path.join(args.output_dir, 'soft_routing_training_config.json')}")
 
     # 保存最终模型
     accelerator.wait_for_everyone()
@@ -839,7 +788,7 @@ def train(args, logger):
         ema_save_path = os.path.join(args.output_dir, f"ema")
         accelerator.save_model(ema_rdt, ema_save_path)
 
-        logger.info(f"保存模型到 {args.output_dir}")
+        logger.info(f"Model saved to {args.output_dir}")
 
         if args.push_to_hub:
             save_model_card(

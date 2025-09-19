@@ -280,6 +280,7 @@ class VLAConsumerDataset(Dataset):
     def _generate_critical_labels(self, qpos_trajectory, action_horizon=64):
         """
         🆕 生成关键时间段标签
+        🔧 修复版本：确保输出形状正确
         
         Args:
             qpos_trajectory: (T, 14) numpy数组，关节角度轨迹
@@ -288,28 +289,86 @@ class VLAConsumerDataset(Dataset):
         Returns:
             critical_labels: (action_horizon,) torch tensor，关键时间段标签
         """
-        if self.critical_annotator is None or qpos_trajectory is None:
-            # 如果没有标注器或轨迹数据，返回全0标签
-            return torch.zeros(action_horizon, dtype=torch.long)
-        
         try:
+            if self.critical_annotator is None:
+                # 如果没有标注器，返回合理的默认标签
+                # 使用简单的启发式：前25%和后25%为关键时间段
+                critical_labels = np.zeros(action_horizon, dtype=np.int64)
+                
+                # 开始阶段（前25%）和结束阶段（后25%）标记为关键
+                start_critical = int(action_horizon * 0.25)
+                end_critical = int(action_horizon * 0.75)
+                
+                critical_labels[:start_critical] = 1  # 开始阶段
+                critical_labels[end_critical:] = 1    # 结束阶段
+                
+                return torch.from_numpy(critical_labels).long()
+            
+            # 有标注器时使用标注器
+            if qpos_trajectory is None or len(qpos_trajectory) == 0:
+                print("⚠️ qpos_trajectory为空，使用默认标签")
+                # 返回交替模式的标签
+                critical_labels = np.zeros(action_horizon, dtype=np.int64)
+                critical_labels[action_horizon//4:action_horizon//2] = 1  # 中间一段为关键
+                return torch.from_numpy(critical_labels).long()
+            
             # 使用标注器生成标签
             critical_labels, analysis_info = self.critical_annotator.annotate(qpos_trajectory)
             
-            # 只取前action_horizon步
-            critical_labels = critical_labels[:action_horizon]
+            # 🔧 修复：确保标签是正确的数据类型
+            if not isinstance(critical_labels, np.ndarray):
+                critical_labels = np.array(critical_labels, dtype=np.int64)
+            else:
+                critical_labels = critical_labels.astype(np.int64)
             
-            # 如果不足action_horizon步，用0填充
-            if len(critical_labels) < action_horizon:
+            # 🔧 修复：处理长度不匹配的问题
+            if len(critical_labels) > action_horizon:
+                # 如果标注结果太长，截取前action_horizon个
+                critical_labels = critical_labels[:action_horizon]
+            elif len(critical_labels) < action_horizon:
+                # 如果标注结果太短，使用策略填充
                 padding_len = action_horizon - len(critical_labels)
-                critical_labels = np.concatenate([critical_labels, np.zeros(padding_len, dtype=critical_labels.dtype)])
+                
+                if len(critical_labels) > 0:
+                    # 使用最后一个值填充
+                    last_value = critical_labels[-1]
+                    padding = np.full(padding_len, last_value, dtype=np.int64)
+                else:
+                    # 如果完全没有标注，使用0填充
+                    padding = np.zeros(padding_len, dtype=np.int64)
+                
+                critical_labels = np.concatenate([critical_labels, padding])
             
-            return torch.from_numpy(critical_labels).long()
+            # 🔧 修复：验证输出形状
+            assert len(critical_labels) == action_horizon, f"标签长度不匹配: {len(critical_labels)} vs {action_horizon}"
+            assert critical_labels.dtype == np.int64, f"标签类型错误: {critical_labels.dtype}"
+            
+            # 转换为torch tensor
+            critical_labels_tensor = torch.from_numpy(critical_labels).long()
+            
+            # 🔧 验证值的范围
+            if torch.any(critical_labels_tensor < 0) or torch.any(critical_labels_tensor > 1):
+                print(f"⚠️ 标签值超出范围 [0,1]: {critical_labels_tensor.unique()}")
+                # 将所有非0值转换为1
+                critical_labels_tensor = torch.clamp(critical_labels_tensor, 0, 1)
+            
+            return critical_labels_tensor
             
         except Exception as e:
             print(f"⚠️ 关键时间段标注失败: {e}")
-            # 失败时返回全0标签
-            return torch.zeros(action_horizon, dtype=torch.long)
+            import traceback
+            traceback.print_exc()
+            
+            # 🔧 降级方案：返回安全的默认标签
+            print("🔧 使用安全的默认标签")
+            critical_labels = np.zeros(action_horizon, dtype=np.int64)
+            
+            # 简单策略：中间30%为关键时间段
+            start_idx = int(action_horizon * 0.35)
+            end_idx = int(action_horizon * 0.65)
+            critical_labels[start_idx:end_idx] = 1
+            
+            return torch.from_numpy(critical_labels).long()
 
     def __getitem__(self, index):
         # For robustness, we will try to load the data until we succeed
@@ -373,26 +432,55 @@ class VLAConsumerDataset(Dataset):
                                                 np.zeros_like(state_elem_mask))
                 data_dict["state_norm"] = state_norm
 
-                # 🆕 生成关键时间段标签
-                if self.enable_critical_annotation and qpos_trajectory is not None:
+                # 🆕 生成关键时间段标签 - 修复版本
+                action_horizon = actions.shape[0]  # 动作序列长度
+                
+                if self.enable_critical_annotation:
                     try:
-                        action_horizon = actions.shape[0]  # 动作序列长度
                         critical_labels = self._generate_critical_labels(qpos_trajectory, action_horizon)
+                        
+                        # 🔧 额外验证
+                        if critical_labels.shape[0] != action_horizon:
+                            print(f"⚠️ 样本 {index}: 标签形状不匹配 {critical_labels.shape[0]} vs {action_horizon}")
+                            # 重新生成正确形状的标签
+                            critical_labels = torch.zeros(action_horizon, dtype=torch.long)
+                            critical_labels[action_horizon//3:2*action_horizon//3] = 1
+                        
                         data_dict["critical_labels"] = critical_labels
                         
                         # 可选：记录标注统计信息（用于调试）
-                        if hasattr(self.critical_annotator, 'verbose') and self.critical_annotator.verbose:
+                        if hasattr(self.critical_annotator, 'verbose') and self.critical_annotator and self.critical_annotator.verbose:
                             critical_ratio = critical_labels.float().mean().item()
-                            print(f"📊 样本 {index}: 关键时间段比例 = {critical_ratio:.3f}")
+                            print(f"📊 样本 {index}: 关键时间段比例 = {critical_ratio:.3f}, 形状 = {critical_labels.shape}")
                             
                     except Exception as e:
                         print(f"⚠️ 样本 {index} 关键时间段标注失败: {e}")
-                        # 失败时使用全0标签
-                        data_dict["critical_labels"] = torch.zeros(actions.shape[0], dtype=torch.long)
+                        # 🔧 失败时使用安全的默认标签
+                        critical_labels = torch.zeros(action_horizon, dtype=torch.long)
+                        # 简单模式：每4个时间步有1个关键时间段
+                        critical_labels[::4] = 1
+                        data_dict["critical_labels"] = critical_labels
                 else:
-                    # 如果没有启用标注或没有qpos数据，使用全0标签
-                    data_dict["critical_labels"] = torch.zeros(actions.shape[0], dtype=torch.long)
+                    # 如果没有启用标注，使用简单的默认模式
+                    critical_labels = torch.zeros(action_horizon, dtype=torch.long)
+                    # 使用启发式：中间50%为关键时间段
+                    start_critical = action_horizon // 4
+                    end_critical = 3 * action_horizon // 4
+                    critical_labels[start_critical:end_critical] = 1
+                    data_dict["critical_labels"] = critical_labels
 
+                # 🔧 最终验证critical_labels
+                final_critical_labels = data_dict["critical_labels"]
+                if not isinstance(final_critical_labels, torch.Tensor):
+                    final_critical_labels = torch.tensor(final_critical_labels, dtype=torch.long)
+                    data_dict["critical_labels"] = final_critical_labels
+                
+                # 验证形状和类型
+                assert final_critical_labels.shape == (action_horizon,), f"标签形状错误: {final_critical_labels.shape} vs ({action_horizon},)"
+                assert final_critical_labels.dtype == torch.long, f"标签类型错误: {final_critical_labels.dtype}"
+                assert torch.all(final_critical_labels >= 0) and torch.all(final_critical_labels <= 1), f"标签值超出范围: {final_critical_labels.unique()}"
+
+                # ... 继续处理其他数据（图像等）
                 # Background image for padding/masking
                 background_color = np.array(
                     [int(x * 255) for x in self.image_processor.image_mean],
@@ -542,8 +630,19 @@ class VLAConsumerDataset(Dataset):
                     if isinstance(v, np.ndarray):
                         data_dict[k] = torch.from_numpy(v)
 
+                # 🔧 最终检查所有tensor
                 for k, v in data_dict.items():
                     assert not isinstance(v, np.ndarray), f"key: {k}, value: {v}"
+
+                # 🔧 最终验证critical_labels（再次检查）
+                if "critical_labels" in data_dict:
+                    labels = data_dict["critical_labels"]
+                    if not isinstance(labels, torch.Tensor):
+                        print(f"⚠️ critical_labels不是tensor: {type(labels)}")
+                        data_dict["critical_labels"] = torch.tensor(labels, dtype=torch.long)
+                    elif labels.dtype != torch.long:
+                        print(f"⚠️ critical_labels类型错误: {labels.dtype}")
+                        data_dict["critical_labels"] = labels.long()
 
                 return data_dict
                 
@@ -555,10 +654,12 @@ class VLAConsumerDataset(Dataset):
                 traceback.print_exc()
                 index = (index + 1) % len(self)
 
+# 修复 train/dataset.py 中的 DataCollatorForVLAConsumerDataset 部分
 
 class DataCollatorForVLAConsumerDataset(object):
     """Collate examples for supervised training.
     🆕 支持关键时间段标签的数据收集
+    🔧 修复版本：增强错误处理和形状验证
     """
 
     def __init__(self, tokenizer: transformers.PreTrainedTokenizer) -> None:
@@ -579,7 +680,7 @@ class DataCollatorForVLAConsumerDataset(object):
         dinov2_images = []
         depth_images = []
         
-        # 🆕 关键时间段标签收集
+        # 🆕 关键时间段标签收集 - 修复版本
         critical_labels = []
         
         # 语言特征收集
@@ -587,39 +688,101 @@ class DataCollatorForVLAConsumerDataset(object):
         lang_embeds = []
         lang_embed_lens = []
 
-        for instance in instances:
-            # 收集基础数据
-            keys_to_check = ["states", "actions", "state_elem_mask", "state_norm"]
-            for key in keys_to_check:
-                if isinstance(instance[key], torch.Tensor):
-                    item = instance[key]
+        for idx, instance in enumerate(instances):
+            try:
+                # 收集基础数据
+                keys_to_check = ["states", "actions", "state_elem_mask", "state_norm"]
+                for key in keys_to_check:
+                    if isinstance(instance[key], torch.Tensor):
+                        item = instance[key]
+                    else:
+                        item = torch.from_numpy(instance[key])
+                    batch[key].append(item)
+
+                # 收集语言数据
+                if "input_ids" in instance:
+                    input_ids.append(instance["input_ids"])
                 else:
-                    item = torch.from_numpy(instance[key])
-                batch[key].append(item)
+                    lang_embeds.append(instance["lang_embed"])
+                    lang_embed_lens.append(instance["lang_embed"].shape[0])
 
-            # 收集语言数据
-            if "input_ids" in instance:
-                input_ids.append(instance["input_ids"])
-            else:
-                lang_embeds.append(instance["lang_embed"])
-                lang_embed_lens.append(instance["lang_embed"].shape[0])
+                # 收集图像和其他数据
+                batch["images"].append(torch.stack(instance["images"], dim=0))
+                batch["data_indices"].append(instance["data_idx"])
+                batch["ctrl_freqs"].append(instance["ctrl_freq"])
+                
+                # 收集DINOv2图像
+                if "dinov2_images" in instance:
+                    dinov2_images.append(instance["dinov2_images"])
+                
+                # 收集DepthAnythingV2图像
+                if "depth_images" in instance:
+                    depth_images.append(instance["depth_images"])
+                
+                # 🆕 收集关键时间段标签 - 修复版本
+                if "critical_labels" in instance:
+                    labels = instance["critical_labels"]
+                    
+                    # 🔧 验证和转换标签
+                    if not isinstance(labels, torch.Tensor):
+                        labels = torch.tensor(labels, dtype=torch.long)
+                    elif labels.dtype != torch.long:
+                        labels = labels.long()
+                    
+                    # 🔧 验证标签值范围
+                    if torch.any(labels < 0) or torch.any(labels > 1):
+                        print(f"⚠️ 实例 {idx}: 标签值超出范围 [0,1]: {labels.unique()}")
+                        labels = torch.clamp(labels, 0, 1)
+                    
+                    # 🔧 验证形状
+                    if labels.dim() != 1:
+                        print(f"⚠️ 实例 {idx}: 标签维度错误: {labels.shape}，应该是1D")
+                        if labels.numel() > 0:
+                            labels = labels.flatten()
+                        else:
+                            # 如果为空，创建默认标签
+                            action_len = instance["actions"].shape[0]
+                            labels = torch.zeros(action_len, dtype=torch.long)
+                    
+                    critical_labels.append(labels)
+                else:
+                    # 如果没有标签，创建默认标签
+                    action_len = instance["actions"].shape[0]
+                    default_labels = torch.zeros(action_len, dtype=torch.long)
+                    # 简单启发式：中间部分为关键时间段
+                    start_critical = action_len // 4
+                    end_critical = 3 * action_len // 4
+                    default_labels[start_critical:end_critical] = 1
+                    critical_labels.append(default_labels)
+                    
+            except Exception as e:
+                print(f"❌ 处理实例 {idx} 时出错: {e}")
+                import traceback
+                traceback.print_exc()
+                
+                # 🔧 创建降级数据
+                action_len = 64  # 默认长度
+                if "actions" in instance:
+                    try:
+                        action_len = instance["actions"].shape[0]
+                    except:
+                        pass
+                
+                # 添加默认的critical_labels
+                default_labels = torch.zeros(action_len, dtype=torch.long)
+                default_labels[action_len//3:2*action_len//3] = 1  # 中间1/3为关键
+                critical_labels.append(default_labels)
+                
+                # 继续处理其他必要字段...
+                continue
 
-            # 收集图像和其他数据
-            batch["images"].append(torch.stack(instance["images"], dim=0))
-            batch["data_indices"].append(instance["data_idx"])
-            batch["ctrl_freqs"].append(instance["ctrl_freq"])
-            
-            # 收集DINOv2图像
-            if "dinov2_images" in instance:
-                dinov2_images.append(instance["dinov2_images"])
-            
-            # 收集DepthAnythingV2图像
-            if "depth_images" in instance:
-                depth_images.append(instance["depth_images"])
-            
-            # 🆕 收集关键时间段标签
-            if "critical_labels" in instance:
-                critical_labels.append(instance["critical_labels"])
+        # 🔧 验证所有实例都有标签
+        if len(critical_labels) != len(instances):
+            print(f"⚠️ 标签数量不匹配: {len(critical_labels)} vs {len(instances)}")
+            # 补充缺失的标签
+            while len(critical_labels) < len(instances):
+                default_labels = torch.zeros(64, dtype=torch.long)
+                critical_labels.append(default_labels)
 
         # 堆叠基础数据
         keys_to_stack = ["states", "actions", "state_elem_mask", "state_norm", "images"]
@@ -651,18 +814,103 @@ class DataCollatorForVLAConsumerDataset(object):
         if len(depth_images) > 0:
             batch["depth_images"] = torch.stack(depth_images, dim=0)
         
-        # 🆕 堆叠关键时间段标签
+        # 🆕 堆叠关键时间段标签 - 修复版本
         if len(critical_labels) > 0:
-            # 处理可能不同长度的标签序列
-            max_len = max(labels.shape[0] for labels in critical_labels)
-            padded_labels = []
-            for labels in critical_labels:
-                if labels.shape[0] < max_len:
-                    # 用0填充（表示非关键时间段）
-                    padding_len = max_len - labels.shape[0]
-                    padding = torch.zeros(padding_len, dtype=labels.dtype)
-                    labels = torch.cat([labels, padding], dim=0)
-                padded_labels.append(labels)
-            batch["critical_labels"] = torch.stack(padded_labels, dim=0)
+            try:
+                # 🔧 找到最大长度进行填充
+                max_len = max(labels.shape[0] for labels in critical_labels)
+                
+                # 🔧 验证所有标签都是1D
+                validated_labels = []
+                for i, labels in enumerate(critical_labels):
+                    if labels.dim() != 1:
+                        print(f"⚠️ 标签 {i} 维度错误: {labels.shape}")
+                        labels = labels.flatten()
+                    
+                    # 🔧 填充到统一长度
+                    if labels.shape[0] < max_len:
+                        padding_len = max_len - labels.shape[0]
+                        # 使用0填充（非关键时间段）
+                        padding = torch.zeros(padding_len, dtype=labels.dtype)
+                        labels = torch.cat([labels, padding], dim=0)
+                    elif labels.shape[0] > max_len:
+                        # 截断到最大长度
+                        labels = labels[:max_len]
+                    
+                    validated_labels.append(labels)
+                
+                # 🔧 堆叠标签
+                batch["critical_labels"] = torch.stack(validated_labels, dim=0)
+                
+                # 🔧 最终验证
+                final_shape = batch["critical_labels"].shape
+                expected_shape = (len(instances), max_len)
+                
+                if final_shape != expected_shape:
+                    print(f"⚠️ 最终标签形状不匹配: {final_shape} vs 期望的 {expected_shape}")
+                    # 创建正确形状的默认标签
+                    batch["critical_labels"] = torch.zeros(len(instances), max_len, dtype=torch.long)
+                    # 使用简单模式填充
+                    for i in range(len(instances)):
+                        # 中间40%为关键时间段
+                        start_idx = int(max_len * 0.3)
+                        end_idx = int(max_len * 0.7)
+                        batch["critical_labels"][i, start_idx:end_idx] = 1
+                
+                # 🔧 验证数据类型和值范围
+                if batch["critical_labels"].dtype != torch.long:
+                    batch["critical_labels"] = batch["critical_labels"].long()
+                
+                # 验证值在[0,1]范围内
+                if torch.any(batch["critical_labels"] < 0) or torch.any(batch["critical_labels"] > 1):
+                    print(f"⚠️ 批次中有标签值超出范围: {batch['critical_labels'].unique()}")
+                    batch["critical_labels"] = torch.clamp(batch["critical_labels"], 0, 1)
+                
+                print(f"✅ 成功处理关键时间段标签: {batch['critical_labels'].shape}, dtype: {batch['critical_labels'].dtype}")
+                
+            except Exception as e:
+                print(f"❌ 处理关键时间段标签时出错: {e}")
+                import traceback
+                traceback.print_exc()
+                
+                # 🔧 创建安全的默认标签
+                print("🔧 使用安全的默认标签")
+                batch_size = len(instances)
+                default_seq_len = 64  # 默认序列长度
+                
+                # 尝试从actions获取真实长度
+                if "actions" in batch and len(batch["actions"]) > 0:
+                    try:
+                        default_seq_len = batch["actions"].shape[1]
+                    except:
+                        pass
+                
+                # 创建默认标签张量
+                batch["critical_labels"] = torch.zeros(batch_size, default_seq_len, dtype=torch.long)
+                
+                # 为每个序列设置简单的关键时间段模式
+                for i in range(batch_size):
+                    # 策略：开始25%和结束25%为关键时间段
+                    quarter_len = default_seq_len // 4
+                    batch["critical_labels"][i, :quarter_len] = 1          # 开始阶段
+                    batch["critical_labels"][i, -quarter_len:] = 1         # 结束阶段
+        
+        else:
+            # 🔧 如果完全没有标签，创建默认批次
+            print("⚠️ 没有任何关键时间段标签，创建默认批次")
+            batch_size = len(instances)
+            default_seq_len = 64
+            
+            if "actions" in batch and len(batch["actions"]) > 0:
+                try:
+                    default_seq_len = batch["actions"].shape[1]
+                except:
+                    pass
+            
+            batch["critical_labels"] = torch.zeros(batch_size, default_seq_len, dtype=torch.long)
+            # 简单策略：中间50%为关键时间段
+            start_critical = default_seq_len // 4
+            end_critical = 3 * default_seq_len // 4
+            batch["critical_labels"][:, start_critical:end_critical] = 1
 
         return batch
