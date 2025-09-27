@@ -865,9 +865,6 @@ class DataCollatorForVLAConsumerDataset(object):
                 if torch.any(batch["critical_labels"] < 0) or torch.any(batch["critical_labels"] > 1):
                     print(f"⚠️ 批次中有标签值超出范围: {batch['critical_labels'].unique()}")
                     batch["critical_labels"] = torch.clamp(batch["critical_labels"], 0, 1)
-                
-                print(f"✅ 成功处理关键时间段标签: {batch['critical_labels'].shape}, dtype: {batch['critical_labels'].dtype}")
-                
             except Exception as e:
                 print(f"❌ 处理关键时间段标签时出错: {e}")
                 import traceback
