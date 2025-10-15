@@ -15,7 +15,7 @@ echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"
 cd ../.. # move to root
 
 PYTHONWARNINGS=ignore::UserWarning \
-python script/eval_policy.py --config policy/$policy_name/deploy_policy.yml \
+python script/eval_policy_simple.py --config policy/$policy_name/deploy_policy.yml \
     --overrides \
     --task_name ${task_name} \
     --task_config ${task_config} \
