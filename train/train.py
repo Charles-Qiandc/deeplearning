@@ -185,27 +185,80 @@ def train(args, logger):
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
-    # 获取软路由双教师REPA和关键时间段标注配置
+    # ⭐ 获取双教师配置
+    global_teacher_type = model_config.get("global_teacher_type", "dinov2")
+    depth_teacher_type = model_config.get("depth_teacher_type", "depth_anything_v2")  # ⭐ 新增
+    
+    # 向后兼容：从旧标志推断
+    if "global_teacher_type" not in model_config:
+        if model_config.get("use_dinov2_features", False):
+            global_teacher_type = "dinov2"
+        elif model_config.get("use_siglip_global_features", False):
+            global_teacher_type = "siglip"
+        else:
+            global_teacher_type = "dinov2"
+    
+    # ⭐ 向后兼容：从旧标志推断深度教师
+    if "depth_teacher_type" not in model_config:
+        if model_config.get("use_depth_features", True):
+            depth_teacher_type = "depth_anything_v2"
+        elif model_config.get("use_siglip_depth_features", False):
+            depth_teacher_type = "siglip"
+        else:
+            depth_teacher_type = "depth_anything_v2"
+    
+    # ⭐ 自动设置特征标志
+    use_dinov2_features = (global_teacher_type == "dinov2")
+    use_siglip_global_features = (global_teacher_type == "siglip")
+    use_depth_anything_v2 = (depth_teacher_type == "depth_anything_v2")
+    use_siglip_depth_features = (depth_teacher_type == "siglip")
+    
+    # 确定特征维度
+    if global_teacher_type == "dinov2":
+        global_feature_dim = 1024
+    elif global_teacher_type == "siglip":
+        global_feature_dim = 1152
+    else:
+        raise ValueError(f"不支持的全局教师类型: {global_teacher_type}")
+    
+    # ⭐ 确定深度特征维度
+    if depth_teacher_type == "depth_anything_v2":
+        depth_feature_dim = 1024
+    elif depth_teacher_type == "siglip":
+        depth_feature_dim = 1152
+    else:
+        raise ValueError(f"不支持的深度教师类型: {depth_teacher_type}")
+    
+    logger.info("=" * 70)
+    logger.info(f"🎯 双教师配置（自动设置）:")
+    logger.info(f"   📊 全局教师:")
+    logger.info(f"      - 类型: {global_teacher_type.upper()}")
+    logger.info(f"      - 特征维度: {global_feature_dim}")
+    logger.info(f"      - use_dinov2_features: {use_dinov2_features}")
+    logger.info(f"      - use_siglip_global_features: {use_siglip_global_features}")
+    logger.info(f"   📊 深度教师:")
+    logger.info(f"      - 类型: {depth_teacher_type.upper()}")
+    logger.info(f"      - 特征维度: {depth_feature_dim}")
+    logger.info(f"      - use_depth_anything_v2: {use_depth_anything_v2}")
+    logger.info(f"      - use_siglip_depth_features: {use_siglip_depth_features}")
+    logger.info("=" * 70)
+    
+    # 获取软路由REPA配置
     enable_soft_routing_repa = model_config.get("enable_soft_routing_repa", True)
     soft_routing_repa_weight = model_config.get("soft_routing_repa_weight", 0.2)
-    use_dinov2_features = model_config.get("use_dinov2_features", True)
-    use_depth_features = model_config.get("use_depth_features", True)
     
     # 关键时间段标注配置
     enable_critical_annotation = model_config.get("enable_critical_annotation", True)
-    task_type = model_config.get("task_type", 1)  # 1=抓取类, 2=点击类
+    task_type = model_config.get("task_type", 1)
     critical_annotation_config = model_config.get("critical_annotation_config", {})
     
     # 软路由配置
     soft_routing_config = model_config.get("soft_routing_config", {})
-    
-    logger.info(f"Soft Routing Dual-Teacher REPA Configuration:")
-    logger.info(f"   - REPA Loss Enabled: {enable_soft_routing_repa}")
-    logger.info(f"   - REPA Loss Weight: {soft_routing_repa_weight}")
-    logger.info(f"   - Use DINOv2 Features: {use_dinov2_features}")
-    logger.info(f"   - Use Depth Features: {use_depth_features}")
-    logger.info(f"   - Critical Annotation: {enable_critical_annotation}")
-    logger.info(f"   - Task Type: {TaskType(task_type).name} ({task_type})")
+    # ⭐ 自动设置维度（如果未配置）
+    if 'global_dim' not in soft_routing_config:
+        soft_routing_config['global_dim'] = global_feature_dim
+    if 'depth_dim' not in soft_routing_config:
+        soft_routing_config['depth_dim'] = depth_feature_dim
 
     # 文本编码器
     if args.precomp_lang_embed:
@@ -218,39 +271,72 @@ def train(args, logger):
         )
         tokenizer, text_encoder = text_embedder.tokenizer, text_embedder.model
 
-    # 视觉编码器
-    vision_encoder = SiglipVisionTower(vision_tower=args.pretrained_vision_encoder_name_or_path, args=None)
+    # SigLIP视觉编码器（主干）
+    vision_encoder = SiglipVisionTower(
+        vision_tower=args.pretrained_vision_encoder_name_or_path, 
+        args=None
+    )
     image_processor = vision_encoder.image_processor
 
-    # 创建DINOv2编码器（全局语义特征）
-    dinov2_encoder = None
-    if use_dinov2_features and enable_soft_routing_repa:
-        logger.info("Loading DINOv2 encoder (Global Semantic Teacher)...")
-        dinov2_encoder = create_dinov2_encoder(model_size="large", select_feature="cls_only")
-        dinov2_encoder.to(accelerator.device, dtype=weight_dtype)
-        dinov2_encoder.print_model_info()
+    # ⭐ 创建全局教师编码器
+    global_teacher_encoder = None
+    if enable_soft_routing_repa:
+        if global_teacher_type == "dinov2":
+            logger.info("📦 加载DINOv2全局教师编码器...")
+            from models.multimodal_encoder.dinov2_encoder import create_dinov2_encoder
+            global_teacher_encoder = create_dinov2_encoder(
+                model_size="large", 
+                select_feature="cls_only"
+            )
+        elif global_teacher_type == "siglip":
+            logger.info("📦 加载SigLIP全局教师编码器...")
+            from models.multimodal_encoder.siglip_global_encoder import create_siglip_global_encoder
+            global_teacher_encoder = create_siglip_global_encoder(
+                model_name=args.pretrained_vision_encoder_name_or_path,
+                pooling_strategy="mean",
+                feature_dim=global_feature_dim
+            )
+        else:
+            raise ValueError(f"不支持的全局教师类型: {global_teacher_type}")
+        
+        global_teacher_encoder.to(accelerator.device, dtype=weight_dtype)
+        global_teacher_encoder.print_model_info()
 
-    # 创建DepthAnythingV2编码器（深度几何特征）
-    depth_encoder = None
-    if use_depth_features and enable_soft_routing_repa:
-        logger.info("Loading DepthAnythingV2 encoder (Depth Geometric Teacher)...")
-        depth_encoder = create_depth_encoder(
-            model_size="metric_large",
-            feature_dim=1024,
-            device=accelerator.device,
-            use_metric_model=True
-        )
-        depth_encoder.to(accelerator.device, dtype=weight_dtype)
-        depth_encoder.print_model_info()
+    # ⭐ 创建深度教师编码器
+    depth_teacher_encoder = None
+    if enable_soft_routing_repa:
+        if depth_teacher_type == "depth_anything_v2":
+            logger.info("📦 加载DepthAnythingV2深度教师编码器...")
+            from models.multimodal_encoder.depth_encoder import create_depth_encoder
+            depth_teacher_encoder = create_depth_encoder(
+                model_size="metric_large",
+                feature_dim=1024,
+                device=accelerator.device,
+                use_metric_model=True
+            )
+        elif depth_teacher_type == "siglip":
+            logger.info("📦 加载SigLIP深度教师编码器...")
+            from models.multimodal_encoder.siglip_depth_encoder import create_siglip_depth_encoder
+            depth_teacher_encoder = create_siglip_depth_encoder(
+                model_name=args.pretrained_vision_encoder_name_or_path,
+                feature_dim=depth_feature_dim,
+                output_format="patch_tokens",  # 可配置
+                device=accelerator.device
+            )
+        else:
+            raise ValueError(f"不支持的深度教师类型: {depth_teacher_type}")
+        
+        depth_teacher_encoder.to(accelerator.device, dtype=weight_dtype)
+        depth_teacher_encoder.print_model_info()
 
-    # 构建RDT模型
-    logger.info("Building Soft Routing Dual-Teacher RDT Model...")
-    img_cond_len = (config["common"]["img_history_size"] * config["common"]["num_cameras"] *
+    # ⭐ 构建RDT模型
+    logger.info("🔨 构建软路由双教师RDT模型...")
+    img_cond_len = (config["common"]["img_history_size"] * 
+                    config["common"]["num_cameras"] *
                     vision_encoder.num_patches)
-    # 🆕 读取对齐层数配置
-    repa_activation_layer = model_config.get("repa_activation_layer", 21)  # 默认21层
     
-    logger.info(f"REPA Alignment Layer: {repa_activation_layer}")
+    repa_activation_layer = model_config.get("repa_activation_layer", 21)
+    
     rdt = RDTRunner(
         action_dim=config["common"]["state_dim"],
         pred_horizon=config["common"]["action_chunk_size"],
@@ -273,14 +359,11 @@ def train(args, logger):
         dtype=weight_dtype,
         enable_soft_routing_repa=enable_soft_routing_repa,
         soft_routing_repa_weight=soft_routing_repa_weight,
-        dinov2_feature_dim=1024,
-        depth_feature_dim=1024,
-        # 软路由配置
+        global_feature_dim=global_feature_dim,
+        depth_feature_dim=depth_feature_dim,  # ⭐ 传递深度维度
         soft_routing_config=soft_routing_config,
-        repa_activation_layer=repa_activation_layer  # ✅ 传入配置值
+        repa_activation_layer=repa_activation_layer
     )
-    print(f"模型总深度: {config['model']['rdt']['depth']}")
-    print(f"实际提取位置: 第 {rdt.model.repa_activation_layer + 1}/{config['model']['rdt']['depth']} 层")
     # 加载预训练权重（如果提供）
     if args.pretrained_model_name_or_path and os.path.isfile(args.pretrained_model_name_or_path):
         logger.info(f"Loading pretrained weights: {args.pretrained_model_name_or_path}")
@@ -357,7 +440,9 @@ def train(args, logger):
         eps=args.adam_epsilon,
     )
     critical_annotation_config = model_config.get("critical_annotation_config", {})
-    # 数据集和数据加载器（集成关键时间段标注）
+    use_dinov2_features = (global_teacher_type == "dinov2")
+    use_siglip_global_features = (global_teacher_type == "siglip")
+    # ⭐ 创建训练数据集（自动传递参数）
     train_dataset = VLAConsumerDataset(
         model_config_path=args.model_config_path,
         config=config["dataset"],
@@ -372,14 +457,18 @@ def train(args, logger):
         state_noise_snr=args.state_noise_snr,
         use_hdf5=args.load_from_hdf5,
         use_precomp_lang_embed=args.precomp_lang_embed,
+        # ⭐ 自动设置的特征标志
         use_dinov2_features=use_dinov2_features,
-        use_depth_features=use_depth_features,
+        use_siglip_global_features=use_siglip_global_features,
+        use_depth_anything_v2=use_depth_anything_v2,  # ⭐ 新增
+        use_siglip_depth_features=use_siglip_depth_features,  # ⭐ 新增
         # 关键时间段标注参数
         task_type=task_type,
         enable_critical_annotation=enable_critical_annotation,
         critical_annotation_config=critical_annotation_config,
     )
     
+    # ⭐ 创建采样数据集（自动传递参数）
     sample_dataset = VLAConsumerDataset(
         model_config_path=args.model_config_path,
         config=config["dataset"],
@@ -388,15 +477,18 @@ def train(args, logger):
         num_cameras=config["common"]["num_cameras"],
         img_history_size=config["common"]["img_history_size"],
         dataset_type=args.dataset_type,
-        image_aug=False,
-        cond_mask_prob=0,
-        cam_ext_mask_prob=-1,
-        state_noise_snr=None,
+        image_aug=args.image_aug,
+        cond_mask_prob=args.cond_mask_prob,
+        cam_ext_mask_prob=args.cam_ext_mask_prob,
+        state_noise_snr=args.state_noise_snr,
         use_hdf5=args.load_from_hdf5,
         use_precomp_lang_embed=args.precomp_lang_embed,
+        # ⭐ 自动设置的特征标志
         use_dinov2_features=use_dinov2_features,
-        use_depth_features=use_depth_features,
-        # 关键时间段标注参数（采样时也启用）
+        use_siglip_global_features=use_siglip_global_features,
+        use_depth_anything_v2=use_depth_anything_v2,  # ⭐ 新增
+        use_siglip_depth_features=use_siglip_depth_features,  # ⭐ 新增
+        # 关键时间段标注参数
         task_type=task_type,
         enable_critical_annotation=enable_critical_annotation,
         critical_annotation_config=critical_annotation_config,
@@ -463,33 +555,35 @@ def train(args, logger):
     if accelerator.is_main_process:
         tracker_config = vars(args).copy()
         tracker_config.update({
+            'global_teacher_type': global_teacher_type,  # ⭐ 记录全局教师类型
+            'global_feature_dim': global_feature_dim,  # ⭐ 记录全局特征维度
             'task_type': task_type,
             'enable_critical_annotation': enable_critical_annotation,
             'critical_annotation_config': critical_annotation_config,
             'enable_soft_routing_repa': enable_soft_routing_repa,
             'soft_routing_config': soft_routing_config,
         })
-        
+        # ⭐ 根据全局教师类型设置运行名
+        task_name = "grasp" if task_type == 1 else "click"
+        run_name = f"RDT_SoftRouting_{global_teacher_type.upper()}_{task_name}_{args.CONFIG_NAME}"
         accelerator.init_trackers(
             "VLA_Soft_Routing_Dual_Teacher_REPA",
             config=tracker_config,
             init_kwargs={"wandb": {
-                "name": f"RDT_SoftRouting_{TaskType(task_type).name}_{args.CONFIG_NAME}",
+                "name": run_name,
             }},
         )
-
     # 训练信息
-    total_batch_size = (args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps)
+    total_batch_size = (args.train_batch_size * accelerator.num_processes * 
+                       args.gradient_accumulation_steps)
 
-    logger.info("***** Starting Soft Routing Dual-Teacher REPA Training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    logger.info(f"  Total train batch size = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
-    logger.info(f"  Task Type = {TaskType(task_type).name}")
-    logger.info(f"  Routing Strategy = Rule-driven + Optional Neural Adjustment")
+    logger.info("***** 开始软路由双教师REPA训练 *****")
+    logger.info(f"  示例数量 = {len(train_dataset)}")
+    logger.info(f"  Epoch数量 = {args.num_train_epochs}")
+    logger.info(f"  全局教师类型 = {global_teacher_type.upper()}")  # ⭐ 新增
+    logger.info(f"  深度教师类型 = DepthAnythingV2")
+    logger.info(f"  任务类型 = {TaskType(task_type).name}")
+    logger.info(f"  路由策略 = 规则驱动 + 可选神经调整")
     
     global_step = 0
     first_epoch = 0
@@ -537,100 +631,100 @@ def train(args, logger):
         'critical_timesteps': 0,
     }
     
-    # 训练循环
+    # 训练循环中的修改
     for epoch in range(first_epoch, args.num_train_epochs):
         rdt.train()
-        
-        # 每个epoch开始时重置batch计数
         accelerator.unwrap_model(rdt).reset_batch_count()
-
-        if args.resume_from_checkpoint and epoch == first_epoch:
-            progress_bar.update(resume_step // args.gradient_accumulation_steps)
 
         for batch in train_dataloader:
             with accelerator.accumulate(rdt):
                 # 准备输入数据
                 images = batch["images"].to(dtype=weight_dtype)
-                states = batch["states"].to(dtype=weight_dtype)[:, -1:, :]  # 只使用最后一个状态
+                states = batch["states"].to(dtype=weight_dtype)[:, -1:, :]
                 actions = batch["actions"].to(dtype=weight_dtype)
                 state_elem_mask = batch["state_elem_mask"].to(dtype=weight_dtype)
                 ctrl_freqs = batch["ctrl_freqs"]
-
-                # 获取关键时间段标签
                 critical_labels = batch.get("critical_labels", None)
-                if critical_labels is not None:
-                    critical_labels = critical_labels.to(accelerator.device)
-                    
-                    # 精简版统计
-                    batch_size, seq_len = critical_labels.shape
-                    soft_routing_stats['total_samples'] += batch_size * seq_len
-                    soft_routing_stats['critical_timesteps'] += critical_labels.sum().item()
 
-                # 编码原始图像（SigLIP）
+                # 编码视觉特征
                 with torch.no_grad():
+                    # 1️⃣ SigLIP编码（主干）
                     batch_size, _, C, H, W = images.shape
                     image_embeds = vision_encoder(images.reshape(-1, C, H, W)).detach()
-                    image_embeds = image_embeds.reshape((batch_size, -1, vision_encoder.hidden_size))
+                    image_embeds = image_embeds.reshape(
+                        (batch_size, -1, vision_encoder.hidden_size)
+                    )
 
+                    # 2️⃣ 文本编码
                     lang_attn_mask = batch["lang_attn_mask"]
-                    text_embeds = (batch["lang_embeds"].to(dtype=weight_dtype) 
-                                 if args.precomp_lang_embed 
-                                 else text_encoder(input_ids=batch["input_ids"], 
-                                                 attention_mask=lang_attn_mask)["last_hidden_state"].detach())
+                    text_embeds = (
+                        batch["lang_embeds"].to(dtype=weight_dtype) 
+                        if args.precomp_lang_embed 
+                        else text_encoder(
+                            input_ids=batch["input_ids"], 
+                            attention_mask=lang_attn_mask
+                        )["last_hidden_state"].detach()
+                    )
 
-                # 提取DINOv2全局语义特征
-                cls_token = None
-                if dinov2_encoder is not None and "dinov2_images" in batch:
-                    with torch.no_grad():
-                        dinov2_images = batch["dinov2_images"].to(dtype=weight_dtype)
-                        dinov2_input = dinov2_images[:, 0]  # (B, 3, 518, 518)
-                        cls_token = dinov2_encoder(dinov2_input)  # (B, 1, 1024)
+                    # 3️⃣ ⭐ 全局教师编码
+                    global_cls_token = None
+                    if global_teacher_encoder is not None:
+                        if global_teacher_type == "dinov2" and "dinov2_images" in batch:
+                            dinov2_images = batch["dinov2_images"].to(dtype=weight_dtype)
+                            dinov2_input = dinov2_images[:, 0]
+                            global_cls_token = global_teacher_encoder(dinov2_input)
+                        
+                        elif global_teacher_type == "siglip" and "siglip_global_images" in batch:
+                            siglip_images = batch["siglip_global_images"].to(dtype=weight_dtype)
+                            siglip_input = siglip_images[:, 0]
+                            global_cls_token = global_teacher_encoder(siglip_input)
 
-                # 提取DepthAnythingV2深度几何特征
-                depth_features = None
-                if depth_encoder is not None and "depth_images" in batch:
-                    with torch.no_grad():
-                        depth_images = batch["depth_images"].to(dtype=weight_dtype)
-                        depth_input = depth_images[:, 0]  # (B, 3, 518, 518)
-                        depth_features, _ = depth_encoder(depth_input)  # (B, 1370, 1024)
+                    # 4️⃣ ⭐ 深度教师编码
+                    depth_features = None
+                    if depth_teacher_encoder is not None:
+                        if depth_teacher_type == "depth_anything_v2" and "depth_images" in batch:
+                            depth_images = batch["depth_images"].to(dtype=weight_dtype)
+                            depth_input = depth_images[:, 0]
+                            depth_features, _ = depth_teacher_encoder(depth_input)
+                        
+                        elif depth_teacher_type == "siglip" and "siglip_depth_images" in batch:
+                            siglip_depth_images = batch["siglip_depth_images"].to(dtype=weight_dtype)
+                            siglip_depth_input = siglip_depth_images[:, 0]
+                            depth_features, _ = depth_teacher_encoder(siglip_depth_input)
 
-                # 计算软路由双教师REPA损失
+                # 计算损失（自动处理不同维度）
                 state_elem_mask = state_elem_mask.unsqueeze(1)
                 if enable_soft_routing_repa:
-                    total_loss, diffusion_loss, repa_loss, detailed_metrics = accelerator.unwrap_model(rdt).compute_loss(
-                        lang_tokens=text_embeds,
-                        lang_attn_mask=lang_attn_mask,
-                        img_tokens=image_embeds,
-                        state_tokens=states,
-                        action_gt=actions,
-                        action_mask=state_elem_mask,
-                        ctrl_freqs=ctrl_freqs,
-                        cls_token=cls_token,              
-                        depth_features=depth_features,   
-                        critical_labels=critical_labels,
+                    total_loss, diffusion_loss, repa_loss, detailed_metrics = (
+                        accelerator.unwrap_model(rdt).compute_loss(
+                            lang_tokens=text_embeds,
+                            lang_attn_mask=lang_attn_mask,
+                            img_tokens=image_embeds,
+                            state_tokens=states,
+                            action_gt=actions,
+                            action_mask=state_elem_mask,
+                            ctrl_freqs=ctrl_freqs,
+                            cls_token=global_cls_token,
+                            depth_features=depth_features,
+                            critical_labels=critical_labels,
+                        )
                     )
+                    
+                    # ⭐⭐⭐ 关键修复：将 total_loss 赋值给 loss
                     loss = total_loss
                     
-                    # ========================================
-                    # 精简版指标收集 - 只保留14个核心指标
-                    # ========================================
+                    # 精简版指标收集
                     loss_for_log = {
-                        # 核心损失 (4个)
                         "diffusion_loss": diffusion_loss.detach().item(),
                         "repa_loss": repa_loss.detach().item(),
                         "alignment_loss": detailed_metrics.get('soft_routing_alignment_loss', 0.0),
-                        
-                        # 性能指标 (2个)  
                         'global_similarity': detailed_metrics.get('global_similarity_avg', 0.0),
                         'depth_similarity': detailed_metrics.get('depth_similarity_avg', 0.0),
-                        
-                        # 路由健康度 (7个)
                         'critical_ratio': detailed_metrics.get('critical_ratio', 0.0),
                         'avg_global_weight': detailed_metrics.get('avg_global_weight', 0.5),
                         'avg_depth_weight': detailed_metrics.get('avg_depth_weight', 0.5),
                     }
                     
-                    # 分类权重 (只在有数据时添加)
                     if 'critical_avg_global_weight' in detailed_metrics:
                         loss_for_log.update({
                             'critical_global_weight': detailed_metrics['critical_avg_global_weight'],
@@ -643,12 +737,10 @@ def train(args, logger):
                             'non_critical_depth_weight': detailed_metrics['non_critical_avg_depth_weight'],
                         })
                     
-                    # 权重调整指标 (可选，第14个指标)
                     if 'weight_drift' in detailed_metrics:
                         loss_for_log['weight_drift'] = detailed_metrics['weight_drift']
                     
                 else:
-                    # 原始方式（兼容性）
                     loss = rdt(
                         lang_tokens=text_embeds,
                         lang_attn_mask=lang_attn_mask,
@@ -661,7 +753,7 @@ def train(args, logger):
                     loss_for_log = {"diffusion_loss": loss.detach().item()}
 
                 # 反向传播
-                accelerator.backward(loss)
+                accelerator.backward(loss)  
                 if accelerator.sync_gradients:
                     params_to_clip = rdt.parameters()
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
@@ -682,43 +774,21 @@ def train(args, logger):
                     accelerator.save_state(save_path)
                     ema_save_path = os.path.join(save_path, f"ema")
                     accelerator.save_model(ema_rdt, ema_save_path)
-                    logger.info(f"Saved state to {save_path}")
+                    logger.info(f"💾 保存检查点到 {save_path}")
 
-                # ========================================
-                # 精简版监控 - 减少日志频率，聚焦核心指标
-                # ========================================
-                
-                # 每500步：核心指标监控
+                # 精简版监控
                 if global_step % 500 == 0 and enable_soft_routing_repa:
-                    logger.info(f"Step {global_step} - Core Metrics:")
-                    logger.info(f"  Losses: diffusion={loss_for_log.get('diffusion_loss', 0):.4f}, "
+                    logger.info(f"Step {global_step} - 核心指标:")
+                    logger.info(f"  损失: diffusion={loss_for_log.get('diffusion_loss', 0):.4f}, "
                                f"repa={loss_for_log.get('repa_loss', 0):.4f}")
+                    logger.info(f"  全局教师: {global_teacher_type.upper()}")  # ⭐ 显示当前教师
                     
                     if 'global_similarity' in loss_for_log:
-                        logger.info(f"  Alignment Quality: global_sim={loss_for_log['global_similarity']:.3f}, "
+                        logger.info(f"  对齐质量: global_sim={loss_for_log['global_similarity']:.3f}, "
                                    f"depth_sim={loss_for_log['depth_similarity']:.3f}")
-                        logger.info(f"  Routing Health: critical_ratio={loss_for_log['critical_ratio']:.3f}, "
+                        logger.info(f"  路由健康: critical_ratio={loss_for_log['critical_ratio']:.3f}, "
                                    f"avg_weights=[{loss_for_log['avg_global_weight']:.3f}, "
                                    f"{loss_for_log['avg_depth_weight']:.3f}]")
-                        
-                        # 权重分配详情
-                        if 'critical_global_weight' in loss_for_log:
-                            logger.info(f"  Critical Weights: [{loss_for_log['critical_global_weight']:.3f}, "
-                                       f"{loss_for_log['critical_depth_weight']:.3f}] "
-                                       f"(expected [0.25, 0.75])")
-                        
-                        if 'non_critical_global_weight' in loss_for_log:
-                            logger.info(f"  Non-Critical Weights: [{loss_for_log['non_critical_global_weight']:.3f}, "
-                                       f"{loss_for_log['non_critical_depth_weight']:.3f}] "
-                                       f"(expected [0.75, 0.25])")
-                        
-                        if 'weight_drift' in loss_for_log:
-                            logger.info(f"  Weight Drift: {loss_for_log['weight_drift']:.4f}")
-                    
-                    # 总体统计
-                    if soft_routing_stats['total_samples'] > 0:
-                        overall_critical_ratio = soft_routing_stats['critical_timesteps'] / soft_routing_stats['total_samples']
-                        logger.info(f"  Overall Critical Ratio: {overall_critical_ratio:.3f}")
 
                 if args.sample_period > 0 and global_step % args.sample_period == 0:
                     sample_loss_for_log = log_sample_res(
@@ -735,7 +805,7 @@ def train(args, logger):
                     logger.info(sample_loss_for_log)
                     accelerator.log(sample_loss_for_log, step=global_step)
 
-            # 记录日志 - 只记录核心指标
+            # 记录日志
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             logs.update(loss_for_log)
             accelerator.log(logs, step=global_step)
@@ -743,33 +813,34 @@ def train(args, logger):
             if global_step >= args.max_train_steps:
                 break
 
-    # 训练结束时的精简统计总结
+    # 训练结束时的总结
     if accelerator.is_main_process:
-        logger.info("Training Complete - Final Summary:")
+        logger.info("训练完成 - 最终总结:")
+        logger.info(f"  全局教师类型: {global_teacher_type.upper()}")  # ⭐ 记录
+        logger.info(f"  全局特征维度: {global_feature_dim}")
         
         if soft_routing_stats['total_samples'] > 0:
-            final_critical_ratio = soft_routing_stats['critical_timesteps'] / soft_routing_stats['total_samples']
-            logger.info(f"  Total Timesteps Processed: {soft_routing_stats['total_samples']}")
-            logger.info(f"  Critical Timesteps: {soft_routing_stats['critical_timesteps']}")
-            logger.info(f"  Final Critical Ratio: {final_critical_ratio:.3f}")
+            final_critical_ratio = (soft_routing_stats['critical_timesteps'] / 
+                                  soft_routing_stats['total_samples'])
+            logger.info(f"  总时间步: {soft_routing_stats['total_samples']}")
+            logger.info(f"  关键时间步: {soft_routing_stats['critical_timesteps']}")
+            logger.info(f"  最终关键比例: {final_critical_ratio:.3f}")
         
-        # 获取最终的软路由配置
-        final_soft_routing_stats = accelerator.unwrap_model(rdt).get_soft_routing_statistics()
-        if final_soft_routing_stats:
-            logger.info(f"  Final Routing Temperature: {final_soft_routing_stats.get('routing_temperature', 1.0):.4f}")
-            logger.info(f"  Neural Adjustment Enabled: {final_soft_routing_stats.get('enable_neural_adjustment', False)}")
-            logger.info(f"  Temporal Smoothing: {final_soft_routing_stats.get('temporal_smoothing', 0.0):.2f}")
-
-        # 保存精简版训练配置
+        # 保存训练配置
+        task_name = "grasp" if task_type == 1 else "click"
         final_config = {
+            'global_teacher_type': global_teacher_type,  # ⭐ 保存教师类型
+            'global_feature_dim': global_feature_dim,
             'task_type': task_type,
-            'task_name': TaskType(task_type).name,
+            'task_name': task_name,
             'enable_critical_annotation': enable_critical_annotation,
             'enable_soft_routing_repa': enable_soft_routing_repa,
             'final_statistics': {
                 'total_timesteps': soft_routing_stats['total_samples'],
                 'critical_timesteps': soft_routing_stats['critical_timesteps'],
-                'critical_ratio': soft_routing_stats['critical_timesteps'] / soft_routing_stats['total_samples'] if soft_routing_stats['total_samples'] > 0 else 0.0,
+                'critical_ratio': (soft_routing_stats['critical_timesteps'] / 
+                                 soft_routing_stats['total_samples'] 
+                                 if soft_routing_stats['total_samples'] > 0 else 0.0),
             },
             'training_hyperparameters': {
                 'soft_routing_repa_weight': soft_routing_repa_weight,
@@ -777,15 +848,14 @@ def train(args, logger):
                 'train_batch_size': args.train_batch_size,
                 'max_train_steps': args.max_train_steps,
             },
-            'soft_routing_final_state': final_soft_routing_stats,
         }
         
         import json
-        with open(os.path.join(args.output_dir, "soft_routing_training_config.json"), "w") as f:
+        config_filename = f"soft_routing_{global_teacher_type}_training_config.json"
+        with open(os.path.join(args.output_dir, config_filename), "w") as f:
             json.dump(final_config, f, indent=2)
         
-        logger.info(f"Training config saved to: {os.path.join(args.output_dir, 'soft_routing_training_config.json')}")
-
+        logger.info(f"训练配置已保存到: {os.path.join(args.output_dir, config_filename)}")
     # 保存最终模型
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:

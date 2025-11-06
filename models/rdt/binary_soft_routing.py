@@ -359,16 +359,16 @@ class SimpleDualTeacherModel(nn.Module):
     
     def __init__(self,
                  action_dim: int = 2048,
-                 dinov2_dim: int = 1024,
+                 global_dim: int = 1152,  # ⭐ 改为 global_dim，支持1024或1152
                  depth_dim: int = 1024,
                  router_config: Dict = None):
         super().__init__()
         
         self.action_dim = action_dim
-        self.dinov2_dim = dinov2_dim
+        self.global_dim = global_dim  # ⭐ 使用统一命名
         self.depth_dim = depth_dim
         
-        # 创建软路由器
+        # 创建软路由器（保持不变）
         if router_config is None:
             router_config = {
                 'action_dim': action_dim,
@@ -382,13 +382,13 @@ class SimpleDualTeacherModel(nn.Module):
         
         self.soft_router = BinaryLabelSoftRouter(**router_config)
         
-        # 特征投影器
-        self.dinov2_projector = nn.Sequential(
-            nn.Linear(dinov2_dim, (dinov2_dim + action_dim) // 2),
-            nn.LayerNorm((dinov2_dim + action_dim) // 2),
+        # ⭐ 特征投影器（自动适配不同维度）
+        self.global_projector = nn.Sequential(
+            nn.Linear(global_dim, (global_dim + action_dim) // 2),
+            nn.LayerNorm((global_dim + action_dim) // 2),
             nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear((dinov2_dim + action_dim) // 2, action_dim),
+            nn.Linear((global_dim + action_dim) // 2, action_dim),
             nn.LayerNorm(action_dim),
         )
         
@@ -408,7 +408,7 @@ class SimpleDualTeacherModel(nn.Module):
     
     def _initialize_weights(self):
         """初始化网络权重"""
-        for module in [self.dinov2_projector, self.depth_projector]:
+        for module in [self.global_projector, self.depth_projector]:
             for layer in module:
                 if isinstance(layer, nn.Linear):
                     nn.init.xavier_uniform_(layer.weight, gain=0.5)
@@ -417,29 +417,35 @@ class SimpleDualTeacherModel(nn.Module):
     
     def compute_alignment_loss(self,
                              action_tokens: torch.Tensor,
-                             dinov2_features: torch.Tensor,
+                             global_features: torch.Tensor,  # ⭐ 改名
                              depth_features: torch.Tensor,
                              routing_weights: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         计算加权对齐损失
+        
+        Args:
+            action_tokens: (B, T, action_dim)
+            global_features: (B, global_dim) 全局教师特征
+            depth_features: (B, depth_dim) 深度教师特征
+            routing_weights: (B, T, 2)
         """
         B, T, _ = action_tokens.shape
         
         # 投影视觉特征到动作空间
-        projected_dinov2 = self.dinov2_projector(dinov2_features)  # (B, action_dim)
+        projected_global = self.global_projector(global_features)  # (B, action_dim)
         projected_depth = self.depth_projector(depth_features)     # (B, action_dim)
         
         # 扩展到时间维度
-        projected_dinov2_expanded = projected_dinov2.unsqueeze(1).expand(-1, T, -1)
+        projected_global_expanded = projected_global.unsqueeze(1).expand(-1, T, -1)
         projected_depth_expanded = projected_depth.unsqueeze(1).expand(-1, T, -1)
         
         # L2归一化
         action_norm = F.normalize(action_tokens, p=2, dim=-1)
-        dinov2_norm = F.normalize(projected_dinov2_expanded, p=2, dim=-1)
+        global_norm = F.normalize(projected_global_expanded, p=2, dim=-1)
         depth_norm = F.normalize(projected_depth_expanded, p=2, dim=-1)
         
         # 计算相似度
-        global_similarity = torch.sum(action_norm * dinov2_norm, dim=-1)  # (B, T)
+        global_similarity = torch.sum(action_norm * global_norm, dim=-1)  # (B, T)
         depth_similarity = torch.sum(action_norm * depth_norm, dim=-1)    # (B, T)
         
         # 温度缩放
@@ -456,8 +462,9 @@ class SimpleDualTeacherModel(nn.Module):
         # 总损失
         total_alignment_loss = (weighted_global_loss + weighted_depth_loss).mean()
         
-        # 🔧 简化对比学习损失，避免复杂的张量操作
-        contrastive_loss = torch.tensor(0.0, device=action_tokens.device, dtype=action_tokens.dtype)
+        # 对比学习损失（简化版）
+        contrastive_loss = torch.tensor(0.0, device=action_tokens.device, 
+                                       dtype=action_tokens.dtype)
         
         # 组合损失
         combined_loss = total_alignment_loss + 0.1 * contrastive_loss
@@ -477,12 +484,15 @@ class SimpleDualTeacherModel(nn.Module):
     
     def forward(self,
                 action_tokens: torch.Tensor,
-                dinov2_features: torch.Tensor,
+                dinov2_features: torch.Tensor,  # ⚠️ 参数名保持不变以兼容
                 depth_features: torch.Tensor,
                 critical_labels: torch.Tensor,
                 is_first_batch: bool = False) -> Dict[str, torch.Tensor]:
         """
         前向传播
+        
+        注意：dinov2_features参数名保持不变是为了向后兼容，
+        实际上可以是DINOv2或SigLIP的全局特征
         """
         B, T, action_dim = action_tokens.shape
         
@@ -502,10 +512,10 @@ class SimpleDualTeacherModel(nn.Module):
         
         routing_weights = routing_results['routing_weights']
         
-        # 2. 计算对齐损失
+        # 2. 计算对齐损失（自动处理不同维度的全局特征）
         alignment_results = self.compute_alignment_loss(
             action_tokens,
-            dinov2_features,
+            dinov2_features,  # 实际上是global_features
             depth_features,
             routing_weights
         )

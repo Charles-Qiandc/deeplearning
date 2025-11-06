@@ -40,7 +40,7 @@ class RDT(nn.Module):
         # REPA相关参数
         enable_repa_loss=True,
         repa_activation_layer=21,
-        dinov2_feature_dim=1024,
+        global_feature_dim=1152,  # ⭐
         depth_feature_dim=1024,  # 深度特征维度
         # 双教师路由参数
         use_dual_teachers=False,
@@ -58,7 +58,7 @@ class RDT(nn.Module):
         # REPA配置
         self.enable_repa_loss = enable_repa_loss
         self.repa_activation_layer = repa_activation_layer - 1  # 转换为0-based索引
-        self.dinov2_feature_dim = dinov2_feature_dim
+        self.global_feature_dim = global_feature_dim  # ⭐ 使用统一命名
         self.depth_feature_dim = depth_feature_dim
         
         # 双教师路由配置
@@ -80,25 +80,29 @@ class RDT(nn.Module):
         
         # 🔄 修改：为每个视觉教师创建独立的投影器
         if self.enable_repa_loss:
-            # DINOv2全局特征投影器：将DINOv2特征投影到动作空间
-            self.dinov2_to_action_projector = nn.Sequential(
-                nn.Linear(dinov2_feature_dim, (dinov2_feature_dim + hidden_size) // 2),  # 1024 → 1536
-                nn.LayerNorm((dinov2_feature_dim + hidden_size) // 2),
+            # ⭐ 全局特征投影器（支持DINOv2=1024或SigLIP=1152）
+            self.global_to_action_projector = nn.Sequential(
+                nn.Linear(
+                    global_feature_dim, 
+                    (global_feature_dim + hidden_size) // 2
+                ),
+                nn.LayerNorm((global_feature_dim + hidden_size) // 2),
                 nn.GELU(),
                 nn.Dropout(0.1),
-                nn.Linear((dinov2_feature_dim + hidden_size) // 2, hidden_size),  # 1536 → 2048
+                nn.Linear((global_feature_dim + hidden_size) // 2, hidden_size),
                 nn.LayerNorm(hidden_size),
             )
             
-            # DepthAnythingV2深度特征投影器：将深度特征投影到动作空间
+            # DepthAnythingV2深度特征投影器
             self.depth_to_action_projector = nn.Sequential(
-                nn.Linear(depth_feature_dim, (depth_feature_dim + hidden_size) // 2),  # 1024 → 1536
+                nn.Linear(depth_feature_dim, (depth_feature_dim + hidden_size) // 2),
                 nn.LayerNorm((depth_feature_dim + hidden_size) // 2),
                 nn.GELU(),
                 nn.Dropout(0.1),
-                nn.Linear((depth_feature_dim + hidden_size) // 2, hidden_size),  # 1536 → 2048
+                nn.Linear((depth_feature_dim + hidden_size) // 2, hidden_size),
                 nn.LayerNorm(hidden_size),
             )
+        
         
         # 双教师路由网络
         if self.use_dual_teachers and self.enable_repa_loss:
@@ -188,8 +192,8 @@ class RDT(nn.Module):
         
         # 🔄 双投影器初始化
         if self.enable_repa_loss:
-            # DINOv2投影器初始化
-            for module in self.dinov2_to_action_projector:
+            # 全局特征投影器初始化
+            for module in self.global_to_action_projector:
                 if isinstance(module, nn.Linear):
                     nn.init.xavier_uniform_(module.weight, gain=0.5)
                     if module.bias is not None:

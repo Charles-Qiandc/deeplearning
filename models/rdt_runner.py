@@ -10,31 +10,27 @@ from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultist
 from models.hub_mixin import CompatiblePyTorchModelHubMixin
 from models.rdt.model import RDT
 from models.rdt.binary_soft_routing import SimpleDualTeacherModel
+from models.multimodal_encoder.siglip_global_encoder import create_siglip_global_encoder
 
-
-class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin, 
-               repo_url="https://huggingface.co/robotics-diffusion-transformer/rdt-1b"):
+class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin):
     """
     集成软路由双教师REPA对齐损失的RDT运行器
-    
-    核心创新：
-    1. 基于关键时间段二元标签的软路由权重分配
-    2. 规则驱动的权重映射：关键时间段偏向深度，非关键时间段偏向全局
-    3. 可选的神经网络微调和时序平滑
-    4. 完整的对比学习和统计分析
+    支持灵活切换全局教师（DINOv2 或 SigLIP）
+    支持灵活切换深度教师（DepthAnythingV2 或 SigLIP）
     """
     def __init__(self, *, action_dim, pred_horizon, config, 
                  lang_token_dim, img_token_dim, state_token_dim, 
                  max_lang_cond_len, img_cond_len, lang_pos_embed_config=None, 
                  img_pos_embed_config=None, dtype=torch.bfloat16,
-                 # 软路由双教师REPA参数
+                 # REPA相关参数
                  enable_soft_routing_repa=True, 
                  soft_routing_repa_weight=0.2,
-                 dinov2_feature_dim=1024,
+                 # ⭐ 修改：支持灵活的双教师维度
+                 global_feature_dim=1152,
                  depth_feature_dim=1024,
                  # 软路由配置
                  soft_routing_config=None,
-                 repa_activation_layer=21  # ✅ 添加参数，默认21
+                 repa_activation_layer=21
                  ):
         super(RDTRunner, self).__init__()
         
@@ -42,16 +38,16 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
         self.enable_soft_routing_repa = enable_soft_routing_repa
         self.soft_routing_repa_weight = soft_routing_repa_weight
         self.dtype = dtype
-        self.dinov2_feature_dim = dinov2_feature_dim
+        self.global_feature_dim = global_feature_dim
         self.depth_feature_dim = depth_feature_dim
         
         print(f"🔧 软路由双教师RDTRunner初始化:")
         print(f"   - 软路由REPA损失启用: {enable_soft_routing_repa}")
         print(f"   - 软路由REPA损失权重: {soft_routing_repa_weight}")
-        print(f"   - DINOv2特征维度: {dinov2_feature_dim}")
-        print(f"   - 深度特征维度: {depth_feature_dim}")
+        print(f"   - 全局教师特征维度: {global_feature_dim}")
+        print(f"   - 深度教师特征维度: {depth_feature_dim}")  # ⭐ 显示深度维度
         print(f"   - 数据类型: {dtype}")
-        print(f"   - REPA激活层: {repa_activation_layer}")  
+        print(f"   - REPA激活层: {repa_activation_layer}")
         
         # 创建扩散模型
         hidden_size = config['rdt']['hidden_size']
@@ -67,9 +63,9 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
             img_pos_embed_config=img_pos_embed_config,
             dtype=dtype,
             enable_repa_loss=enable_soft_routing_repa,
-            repa_activation_layer=repa_activation_layer,  
-            dinov2_feature_dim=dinov2_feature_dim,
-            depth_feature_dim=depth_feature_dim,
+            repa_activation_layer=repa_activation_layer,
+            global_feature_dim=global_feature_dim,
+            depth_feature_dim=depth_feature_dim,  # ⭐ 传递深度维度
         )
 
         # 适配器创建
@@ -99,18 +95,18 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
             # 设置默认软路由配置
             default_soft_routing_config = {
                 'action_dim': hidden_size,
-                'dinov2_dim': dinov2_feature_dim,
-                'depth_dim': depth_feature_dim,
+                'global_dim': global_feature_dim,
+                'depth_dim': depth_feature_dim,  # ⭐ 使用灵活的深度维度
                 'router_config': {
                     'action_dim': hidden_size,
-                    'critical_global_weight': 0.25,      # 关键时间段：全局25%，深度75%
+                    'critical_global_weight': 0.25,
                     'critical_depth_weight': 0.75,
-                    'non_critical_global_weight': 0.75,  # 非关键时间段：全局75%，深度25%
+                    'non_critical_global_weight': 0.75,
                     'non_critical_depth_weight': 0.25,
-                    'enable_neural_adjustment': False,    # 不启用神经网络微调
-                    'adjustment_strength': 0.1,          # 微调强度
-                    'temporal_smoothing': 0.9,           # 时序平滑系数
-                    'temperature': 1.0,                  # softmax温度
+                    'enable_neural_adjustment': False,
+                    'adjustment_strength': 0.1,
+                    'temporal_smoothing': 0.9,
+                    'temperature': 1.0,
                 }
             }
             
@@ -118,7 +114,9 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
             if soft_routing_config:
                 default_soft_routing_config.update(soft_routing_config)
                 if 'router_config' in soft_routing_config:
-                    default_soft_routing_config['router_config'].update(soft_routing_config['router_config'])
+                    default_soft_routing_config['router_config'].update(
+                        soft_routing_config['router_config']
+                    )
             
             self.soft_routing_config = default_soft_routing_config
             self.dual_teacher_model = SimpleDualTeacherModel(**default_soft_routing_config)
@@ -126,12 +124,10 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
             
             print(f"🎯 软路由双教师对齐模型配置:")
             router_config = default_soft_routing_config['router_config']
-            print(f"   - 关键时间段权重: 全局{router_config['critical_global_weight']:.2f}, 深度{router_config['critical_depth_weight']:.2f}")
-            print(f"   - 非关键时间段权重: 全局{router_config['non_critical_global_weight']:.2f}, 深度{router_config['non_critical_depth_weight']:.2f}")
-            print(f"   - 神经网络微调: {router_config['enable_neural_adjustment']}")
-            print(f"   - 时序平滑系数: {router_config['temporal_smoothing']}")
-            print(f"   - 微调强度: {router_config['adjustment_strength']}")
-        
+            print(f"   - 关键时间段权重: 全局{router_config['critical_global_weight']:.2f}, "
+                  f"深度{router_config['critical_depth_weight']:.2f}")
+            print(f"   - 非关键时间段权重: 全局{router_config['non_critical_global_weight']:.2f}, "
+                  f"深度{router_config['non_critical_depth_weight']:.2f}")
         # 噪声调度器创建
         noise_scheduler_config = config['noise_scheduler']
         self.noise_scheduler = DDPMScheduler(
@@ -167,14 +163,19 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
             dual_teacher_params = sum(p.numel() for p in self.dual_teacher_model.parameters())
             print(f"Soft routing dual teacher params: {dual_teacher_params:e}")
 
-    def compute_soft_routing_dual_teacher_repa_loss(self, action_tokens, dinov2_cls_token, 
-                                                   depth_cls_token, critical_labels):
+    def compute_soft_routing_dual_teacher_repa_loss(
+        self, action_tokens, global_cls_token, depth_cls_token, critical_labels
+    ):
         """
+        ⭐ 修改：统一接口，支持DINOv2/SigLIP全局特征
+        
         计算基于软路由的双教师REPA对齐损失
         
         Args:
             action_tokens: (B, T, hidden_size) 动作tokens
-            dinov2_cls_token: (B, 1, dinov2_dim) 或 (B, dinov2_dim) DINOv2全局特征
+            global_cls_token: (B, 1, global_dim) 或 (B, global_dim) 全局特征
+                - DINOv2: 1024维
+                - SigLIP: 1152维
             depth_cls_token: (B, depth_dim) 深度特征
             critical_labels: (B, T) 关键时间段标签（0/1）
         
@@ -187,15 +188,19 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
         dtype = action_tokens.dtype
         
         # 确保特征维度正确
-        if dinov2_cls_token.dim() == 3:
-            dinov2_cls_squeezed = dinov2_cls_token.squeeze(1)  # (B, dinov2_dim)
+        if global_cls_token.dim() == 3:
+            global_cls_squeezed = global_cls_token.squeeze(1)  # (B, global_dim)
         else:
-            dinov2_cls_squeezed = dinov2_cls_token
+            global_cls_squeezed = global_cls_token
         
         if depth_cls_token.dim() == 3:
             depth_cls_squeezed = depth_cls_token.squeeze(1)  # (B, depth_dim)
         else:
             depth_cls_squeezed = depth_cls_token
+        
+        # 验证维度
+        assert global_cls_squeezed.shape[-1] == self.global_feature_dim, \
+            f"全局特征维度不匹配: {global_cls_squeezed.shape[-1]} vs {self.global_feature_dim}"
         
         # 确保关键时间段标签类型正确
         if critical_labels.dtype != torch.long:
@@ -208,7 +213,7 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
             # 使用软路由双教师模型计算对齐损失
             results = self.dual_teacher_model(
                 action_tokens=action_tokens,
-                dinov2_features=dinov2_cls_squeezed,
+                dinov2_features=global_cls_squeezed,  # ⚠️ 参数名保持不变以兼容
                 depth_features=depth_cls_squeezed,
                 critical_labels=critical_labels,
                 is_first_batch=is_first_batch
@@ -287,11 +292,12 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
                 'error': str(e),
             }
             return zero_loss, fallback_metrics
-
     def compute_loss(self, lang_tokens, lang_attn_mask, img_tokens, 
                      state_tokens, action_gt, action_mask, ctrl_freqs,
                      cls_token=None, depth_features=None, critical_labels=None):
         """
+        ⭐ 修改：cls_token现在可以是DINOv2或SigLIP的全局特征
+        
         计算总损失，包括扩散损失和软路由双教师REPA损失
         """
         batch_size = lang_tokens.shape[0]
@@ -306,7 +312,9 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
         
         # 扩散损失计算
         noise = torch.randn(action_gt.shape, dtype=action_gt.dtype, device=device)
-        timesteps = torch.randint(0, self.num_train_timesteps, (batch_size,), device=device).long()
+        timesteps = torch.randint(
+            0, self.num_train_timesteps, (batch_size,), device=device
+        ).long()
         noisy_action = self.noise_scheduler.add_noise(action_gt, noise, timesteps)
         
         state_action_traj = torch.cat([state_tokens, noisy_action], dim=1)
@@ -349,14 +357,14 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
             
             # 提取深度CLS token
             if depth_features.shape[1] >= 1:
-                depth_cls_token = depth_features[:, 0, :]  # (B, depth_dim)
+                depth_cls_token = depth_features[:, 0, :]
             else:
                 depth_cls_token = cls_token.squeeze(1) if cls_token.dim() == 3 else cls_token
             
-            # 计算软路由双教师对齐损失
+            # ⭐ 计算软路由双教师对齐损失（cls_token可以是DINOv2或SigLIP）
             repa_loss, detailed_metrics = self.compute_soft_routing_dual_teacher_repa_loss(
                 action_tokens=action_tokens,
-                dinov2_cls_token=cls_token,
+                global_cls_token=cls_token,  # 统一接口
                 depth_cls_token=depth_cls_token,
                 critical_labels=critical_labels
             )
@@ -369,7 +377,7 @@ class RDTRunner(nn.Module, CompatiblePyTorchModelHubMixin,
         self.batch_count += 1
         
         return total_loss, diffusion_loss, repa_loss, detailed_metrics
-
+    
     def conditional_sample(self, lang_cond, lang_attn_mask, img_cond, state_traj, action_mask, ctrl_freqs):
         """推理时的条件采样，不涉及对齐机制"""
         device = state_traj.device

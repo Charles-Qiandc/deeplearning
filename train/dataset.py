@@ -77,8 +77,8 @@ def read_dirty_bit(chunk_dir):
 
 
 class VLAConsumerDataset(Dataset):
-    """A vision-language-action Dataset for supervised training.
-    🆕 集成任务驱动的关键时间段标注机制
+    """
+    支持多种全局教师和深度教师的VLA数据集
     """
 
     def __init__(
@@ -99,14 +99,15 @@ class VLAConsumerDataset(Dataset):
         use_hdf5=False,
         use_precomp_lang_embed=False,
         use_dinov2_features=False,
-        use_depth_features=False,
-        # 🆕 关键时间段标注相关参数
-        task_type: int = 1,  # 1=抓取类, 2=点击类
+        use_siglip_global_features=False,
+        use_depth_anything_v2=False,  # ⭐ 新增
+        use_siglip_depth_features=False,  # ⭐ 新增
+        # 关键时间段标注相关参数
+        task_type: int = 1,
         enable_critical_annotation: bool = True,
         critical_annotation_config: Dict = None,
     ):
         super(VLAConsumerDataset, self).__init__()
-
         # Load the control frequency for each dataset
         with open("configs/dataset_control_freq.json", "r") as fp:
             self.control_freq = json.load(fp)
@@ -139,13 +140,52 @@ class VLAConsumerDataset(Dataset):
         if use_precomp_lang_embed:
             self.empty_lang_embed = torch.load("data/empty_lang_embed.pt")
         
-        # DINOv2相关配置
+        # ⭐ 全局教师特征配置
         self.use_dinov2_features = use_dinov2_features
-        self.dinov2_image_size = 518
+        self.use_siglip_global_features = use_siglip_global_features
         
-        # DepthAnythingV2相关配置
-        self.use_depth_features = use_depth_features
-        self.depth_image_size = 518
+        # 确保只启用一个全局教师
+        if use_dinov2_features and use_siglip_global_features:
+            raise ValueError("不能同时启用DINOv2和SigLIP作为全局教师")
+        
+        # 根据全局教师类型设置图像尺寸
+        if use_dinov2_features:
+            self.global_teacher_image_size = 518
+            self.global_teacher_type = "dinov2"
+        elif use_siglip_global_features:
+            self.global_teacher_image_size = 384
+            self.global_teacher_type = "siglip"
+        else:
+            self.global_teacher_image_size = None
+            self.global_teacher_type = None
+        
+        # ⭐ 深度教师特征配置
+        self.use_depth_anything_v2 = use_depth_anything_v2
+        self.use_siglip_depth_features = use_siglip_depth_features
+        
+        # 确保只启用一个深度教师
+        if use_depth_anything_v2 and use_siglip_depth_features:
+            raise ValueError("不能同时启用DepthAnythingV2和SigLIP作为深度教师")
+        
+        # 根据深度教师类型设置图像尺寸
+        if use_depth_anything_v2:
+            self.depth_teacher_image_size = 518
+            self.depth_teacher_type = "depth_anything_v2"
+        elif use_siglip_depth_features:
+            self.depth_teacher_image_size = 384
+            self.depth_teacher_type = "siglip"
+        else:
+            self.depth_teacher_image_size = None
+            self.depth_teacher_type = None
+        # 打印配置信息
+        if self.global_teacher_type or self.depth_teacher_type:
+            print(f"📊 数据集双教师配置:")
+            if self.global_teacher_type:
+                print(f"   - 全局教师: {self.global_teacher_type.upper()} "
+                      f"(图像尺寸: {self.global_teacher_image_size})")
+            if self.depth_teacher_type:
+                print(f"   - 深度教师: {self.depth_teacher_type.upper()} "
+                      f"(图像尺寸: {self.depth_teacher_image_size})")
 
         # Load dataset stat
         with open("configs/dataset_stat.json", "r") as f:
@@ -521,8 +561,8 @@ class VLAConsumerDataset(Dataset):
                         else:
                             rearranged_images.append((background_image.copy(), False))
 
-                # 为DINOv2准备单独的图像
-                if self.use_dinov2_features:
+                # ⭐ 为全局教师准备图像
+                if self.use_dinov2_features or self.use_siglip_global_features:
                     camera_idx = 0
                     frame_idx = self.img_history_size - 1
                     
@@ -533,11 +573,14 @@ class VLAConsumerDataset(Dataset):
                     image, valid = images[frame_idx], image_mask[frame_idx]
                     
                     if not valid or math.prod(image.shape) <= 0:
-                        raise ValueError(f"DINOv2图像无效")
+                        raise ValueError(f"全局教师图像无效")
                     
-                    # 预处理DINOv2图像
+                    # 预处理全局教师图像
                     pil_image = Image.fromarray(image)
-                    pil_image = pil_image.resize((self.dinov2_image_size, self.dinov2_image_size), Image.BILINEAR)
+                    pil_image = pil_image.resize(
+                        (self.global_teacher_image_size, self.global_teacher_image_size), 
+                        Image.BILINEAR
+                    )
                     image_array = np.array(pil_image).astype(np.float32) / 255.0
                     image_tensor = torch.from_numpy(image_array).permute(2, 0, 1)
                     
@@ -546,25 +589,32 @@ class VLAConsumerDataset(Dataset):
                     std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
                     image_tensor = (image_tensor - mean) / std
                     
-                    data_dict["dinov2_images"] = image_tensor.unsqueeze(0)
+                    # 根据全局教师类型保存
+                    if self.use_dinov2_features:
+                        data_dict["dinov2_images"] = image_tensor.unsqueeze(0)
+                    elif self.use_siglip_global_features:
+                        data_dict["siglip_global_images"] = image_tensor.unsqueeze(0)
 
-                # 为DepthAnythingV2准备深度图像
-                if self.use_depth_features:
+                # ⭐ 为深度教师准备图像
+                if self.use_depth_anything_v2 or self.use_siglip_depth_features:
                     camera_idx = 0
                     frame_idx = self.img_history_size - 1
                     
                     if camera_idx >= len(image_metas):
-                        raise ValueError(f"深度编码器相机索引 {camera_idx} 超出范围")
+                        raise ValueError(f"深度教师相机索引 {camera_idx} 超出范围")
                     
                     images, image_mask = image_metas[camera_idx]
                     image, valid = images[frame_idx], image_mask[frame_idx]
                     
                     if not valid or math.prod(image.shape) <= 0:
-                        raise ValueError(f"深度编码器图像无效")
+                        raise ValueError(f"深度教师图像无效")
                     
-                    # DepthAnythingV2预处理
+                    # 预处理深度教师图像
                     pil_image = Image.fromarray(image)
-                    pil_image = pil_image.resize((self.depth_image_size, self.depth_image_size), Image.BILINEAR)
+                    pil_image = pil_image.resize(
+                        (self.depth_teacher_image_size, self.depth_teacher_image_size), 
+                        Image.BILINEAR
+                    )
                     image_array = np.array(pil_image).astype(np.float32) / 255.0
                     image_tensor = torch.from_numpy(image_array).permute(2, 0, 1)
                     
@@ -573,7 +623,11 @@ class VLAConsumerDataset(Dataset):
                     std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
                     image_tensor = (image_tensor - mean) / std
                     
-                    data_dict["depth_images"] = image_tensor.unsqueeze(0)
+                    # ⭐ 根据深度教师类型保存
+                    if self.use_depth_anything_v2:
+                        data_dict["depth_images"] = image_tensor.unsqueeze(0)
+                    elif self.use_siglip_depth_features:
+                        data_dict["siglip_depth_images"] = image_tensor.unsqueeze(0)
 
                 # 处理原始图像（SigLIP编码用）
                 preprocessed_images = []
@@ -668,9 +722,8 @@ class VLAConsumerDataset(Dataset):
 # 修复 train/dataset.py 中的 DataCollatorForVLAConsumerDataset 部分
 
 class DataCollatorForVLAConsumerDataset(object):
-    """Collate examples for supervised training.
-    🆕 支持关键时间段标签的数据收集
-    🔧 修复版本：增强错误处理和形状验证
+    """
+    支持多种全局教师和深度教师的数据收集器
     """
 
     def __init__(self, tokenizer: transformers.PreTrainedTokenizer) -> None:
@@ -687,17 +740,20 @@ class DataCollatorForVLAConsumerDataset(object):
             "ctrl_freqs": [],
         }
         
-        # 视觉特征收集
+        # ⭐ 视觉特征收集（支持两种全局教师和两种深度教师）
         dinov2_images = []
+        siglip_global_images = []
         depth_images = []
+        siglip_depth_images = []  # ⭐ 新增
         
-        # 🆕 关键时间段标签收集 - 修复版本
+        # 关键时间段标签收集
         critical_labels = []
         
         # 语言特征收集
         input_ids = []
         lang_embeds = []
         lang_embed_lens = []
+
 
         for idx, instance in enumerate(instances):
             try:
@@ -722,13 +778,19 @@ class DataCollatorForVLAConsumerDataset(object):
                 batch["data_indices"].append(instance["data_idx"])
                 batch["ctrl_freqs"].append(instance["ctrl_freq"])
                 
-                # 收集DINOv2图像
+                # ⭐ 收集全局教师图像
                 if "dinov2_images" in instance:
                     dinov2_images.append(instance["dinov2_images"])
                 
-                # 收集DepthAnythingV2图像
+                if "siglip_global_images" in instance:
+                    siglip_global_images.append(instance["siglip_global_images"])
+                
+                # ⭐ 收集深度教师图像
                 if "depth_images" in instance:
                     depth_images.append(instance["depth_images"])
+                
+                if "siglip_depth_images" in instance:
+                    siglip_depth_images.append(instance["siglip_depth_images"])
                 
                 # 🆕 收集关键时间段标签 - 修复版本
                 if "critical_labels" in instance:
@@ -817,13 +879,21 @@ class DataCollatorForVLAConsumerDataset(object):
             batch["lang_embeds"] = lang_embeds
             batch["lang_attn_mask"] = input_lang_attn_mask
         
-        # 堆叠DINOv2图像
+        # ⭐ 堆叠全局教师图像
         if len(dinov2_images) > 0:
             batch["dinov2_images"] = torch.stack(dinov2_images, dim=0)
         
-        # 堆叠DepthAnythingV2图像
+        if len(siglip_global_images) > 0:
+            batch["siglip_global_images"] = torch.stack(siglip_global_images, dim=0)
+        
+        # ⭐ 堆叠深度教师图像
         if len(depth_images) > 0:
             batch["depth_images"] = torch.stack(depth_images, dim=0)
+        
+        if len(siglip_depth_images) > 0:
+            batch["siglip_depth_images"] = torch.stack(siglip_depth_images, dim=0)
+        
+        
         
         # 🆕 堆叠关键时间段标签 - 修复版本
         if len(critical_labels) > 0:
