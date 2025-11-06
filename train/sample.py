@@ -99,3 +99,98 @@ def log_sample_res(
         torch.cuda.empty_cache()
 
         return dict(loss_for_log)
+    
+    
+    
+    
+# from collections import defaultdict
+# import torch
+# import torch.nn.functional as F
+
+
+# @torch.no_grad()
+# def log_sample_res(
+#     text_encoder,
+#     vision_encoder,
+#     rdt,
+#     args,
+#     accelerator,
+#     weight_dtype,
+#     dataset_id2name,
+#     sample_dataloader,
+#     logger,
+#     # 🆕 新增参数
+#     dinov2_encoder=None,
+#     depth_encoder=None,
+# ):
+#     """评估采样（支持视觉融合模式）"""
+#     rdt.eval()
+    
+#     total_loss = 0.0
+#     num_batches = 0
+    
+#     with torch.no_grad():
+#         for batch_idx, batch in enumerate(sample_dataloader):
+#             if batch_idx >= args.num_sample_batches:
+#                 break
+            
+#             # 准备输入
+#             images = batch["images"].to(dtype=weight_dtype)
+#             states = batch["states"].to(dtype=weight_dtype)[:, -1:, :]
+#             actions = batch["actions"].to(dtype=weight_dtype)
+#             state_elem_mask = batch["state_elem_mask"].to(dtype=weight_dtype)
+#             ctrl_freqs = batch["ctrl_freqs"]
+            
+#             # 编码
+#             batch_size, _, C, H, W = images.shape
+#             image_embeds = vision_encoder(images.reshape(-1, C, H, W)).detach()
+#             image_embeds = image_embeds.reshape((batch_size, -1, vision_encoder.hidden_size))
+            
+#             lang_attn_mask = batch["lang_attn_mask"]
+#             text_embeds = (
+#                 batch["lang_embeds"].to(dtype=weight_dtype) 
+#                 if args.precomp_lang_embed 
+#                 else text_encoder(
+#                     input_ids=batch["input_ids"], 
+#                     attention_mask=lang_attn_mask
+#                 )["last_hidden_state"].detach()
+#             )
+            
+#             # 🆕 编码DINOv2和Depth
+#             dinov2_features = None
+#             if dinov2_encoder is not None and "dinov2_images" in batch:
+#                 dinov2_images = batch["dinov2_images"].to(dtype=weight_dtype)
+#                 dinov2_input = dinov2_images[:, 0]
+#                 dinov2_features = dinov2_encoder(dinov2_input)
+            
+#             depth_features = None
+#             if depth_encoder is not None and "depth_images" in batch:
+#                 depth_images = batch["depth_images"].to(dtype=weight_dtype)
+#                 depth_input = depth_images[:, 0]
+#                 depth_features, _ = depth_encoder(depth_input)
+            
+#             # 计算损失
+#             state_elem_mask = state_elem_mask.unsqueeze(1)
+#             loss = accelerator.unwrap_model(rdt).compute_loss(
+#                 lang_tokens=text_embeds,
+#                 lang_attn_mask=lang_attn_mask,
+#                 img_tokens=image_embeds,
+#                 state_tokens=states,
+#                 action_gt=actions,
+#                 action_mask=state_elem_mask,
+#                 ctrl_freqs=ctrl_freqs,
+#                 dinov2_features=dinov2_features,
+#                 depth_features=depth_features,
+#             )
+            
+#             total_loss += loss.item()
+#             num_batches += 1
+    
+#     rdt.train()
+    
+#     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    
+#     return {
+#         "sample_loss": avg_loss,
+#         "num_sample_batches": num_batches
+#     }

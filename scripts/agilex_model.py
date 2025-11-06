@@ -182,24 +182,28 @@ class RoboticDiffusionTransformerModel(object):
             # 统计结果
             print(f"✅ 成功加载 {len(filtered_checkpoint)} 个参数")
             
+            # ===== 🔍 添加这部分：打印所有未加载的参数 =====
+            if missing_keys:
+                print(f"\n⚠️  {len(missing_keys)} 个模型参数未找到对应权重（保持默认初始化）:")
+                for i, key in enumerate(missing_keys, 1):
+                    print(f"     {i}. {key}")
+            # =============================================
+            
             if skipped_params:
                 routing_skipped = [p for p in skipped_params if 'routing' in p]
                 teacher_skipped = [p for p in skipped_params if any(x in p for x in ['dinov2_to_action', 'depth_to_action'])]
                 other_skipped = [p for p in skipped_params if p not in routing_skipped and p not in teacher_skipped]
                 
                 if routing_skipped:
-                    print(f"⚠️  跳过 {len(routing_skipped)} 个路由网络参数（评估时不需要）")
+                    print(f"\n⚠️  跳过 {len(routing_skipped)} 个路由网络参数（评估时不需要）")
                 if teacher_skipped:
-                    print(f"⚠️  跳过 {len(teacher_skipped)} 个双教师参数（评估时不需要）")
+                    print(f"\n⚠️  跳过 {len(teacher_skipped)} 个双教师参数（评估时不需要）")
                 if other_skipped:
-                    print(f"⚠️  跳过 {len(other_skipped)} 个其他参数")
-                    for param in other_skipped[:3]:  # 只显示前3个
+                    print(f"\n⚠️  跳过 {len(other_skipped)} 个其他参数")
+                    for param in other_skipped:  # 显示所有
                         print(f"     - {param}")
             
-            if missing_keys:
-                print(f"⚠️  {len(missing_keys)} 个模型参数未找到对应权重（保持默认初始化）")
-            
-            print("✅ 权重加载完成，模型可以正常评估")
+            print("\n✅ 权重加载完成，模型可以正常评估")
             return True
             
         except Exception as e:
@@ -208,6 +212,7 @@ class RoboticDiffusionTransformerModel(object):
             import traceback
             traceback.print_exc()
             return False
+        
     def encode_instruction(self, instruction, device="cuda"):
         """Encode string instruction to latent embeddings.
 

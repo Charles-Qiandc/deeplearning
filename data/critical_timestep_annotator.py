@@ -112,31 +112,50 @@ class TaskDrivenCriticalTimestepAnnotator:
     1. 基于任务类型的不同标注逻辑
     2. 夹爪状态作为关键时间节点
     3. 双臂独立标注但联合输出
+    🆕 4. 支持随机标注模式
     
     标注策略：
     - 抓取类：减速对准 → 夹爪闭合（关键时间段）
     - 点击类：夹爪闭合 → 减速对准（关键时间段）
+    - 随机类：每个时间步独立随机判定
     """
     
     def __init__(self, 
                  task_type: TaskType = TaskType.GRASP,
+                 # 🆕 随机标注参数
+                 use_random_annotation: bool = False,
+                 random_critical_ratio: float = 0.3,
+                 random_seed: Optional[int] = None,
+                 # 原有参数
                  relative_low_speed_ratio: float = 0.15,
                  min_deceleration_threshold: float = -0.0008,
-                 gripper_close_delta_threshold: float = 0.01,  # 🔧 夹爪闭合变化阈值
+                 gripper_close_delta_threshold: float = 0.01,
                  smooth: bool = True,
                  verbose: bool = False):
         """
         初始化任务驱动的关键时间段标注器
         
+        🆕 随机标注参数:
+            use_random_annotation: 是否使用随机标注（True=随机，False=任务驱动）
+            random_critical_ratio: 随机标注的关键帧比例（默认0.3 = 30%）
+            random_seed: 随机种子（可选，用于可复现性）
+        
         Args:
             task_type: 任务类型（GRASP=1, CLICK=2）
             relative_low_speed_ratio: 相对低速比例（默认15%）
             min_deceleration_threshold: 最小减速度阈值（默认-0.0008）
-            gripper_close_delta_threshold: 夹爪闭合变化阈值（默认0.01，检测夹爪开始闭合）
+            gripper_close_delta_threshold: 夹爪闭合变化阈值（默认0.01）
             smooth: 是否平滑速度曲线
             verbose: 是否打印详细信息
         """
         self.task_type = task_type
+        
+        # 🆕 随机标注配置
+        self.use_random_annotation = use_random_annotation
+        self.random_critical_ratio = random_critical_ratio
+        self.random_seed = random_seed
+        
+        # 原有配置
         self.relative_low_speed_ratio = relative_low_speed_ratio
         self.min_deceleration_threshold = min_deceleration_threshold
         self.gripper_close_delta_threshold = gripper_close_delta_threshold
@@ -146,9 +165,17 @@ class TaskDrivenCriticalTimestepAnnotator:
         # 初始化正运动学计算器
         self.fk_calculator = AgilexForwardKinematics()
         
-        # 任务类型验证
-        if task_type not in [TaskType.GRASP, TaskType.CLICK]:
+        # 任务类型验证（仅在任务驱动模式下需要）
+        if not use_random_annotation and task_type not in [TaskType.GRASP, TaskType.CLICK]:
             raise ValueError(f"不支持的任务类型: {task_type}")
+        
+        # 🆕 打印模式信息
+        if self.verbose:
+            if use_random_annotation:
+                print(f"🎲 初始化: 随机标注模式 (关键帧比例: {random_critical_ratio:.1%})")
+            else:
+                task_name = "抓取类" if task_type == TaskType.GRASP else "点击类"
+                print(f"🎯 初始化: 任务驱动标注模式 ({task_name})")
         
     def compute_velocity(self, trajectory: np.ndarray) -> np.ndarray:
         """计算轨迹速度（欧氏范数）"""
@@ -187,7 +214,7 @@ class TaskDrivenCriticalTimestepAnnotator:
         """
         gripper_close_points = []
     
-        # 🔧 新增：检测静态臂
+        # 检测静态臂
         gripper_range = gripper_trajectory.max() - gripper_trajectory.min()
         gripper_std = gripper_trajectory.std()
         
@@ -200,15 +227,15 @@ class TaskDrivenCriticalTimestepAnnotator:
         # 计算夹爪开度的变化率（负值表示闭合）
         gripper_delta = np.diff(gripper_trajectory, prepend=gripper_trajectory[0])
         
-        # 🔧 修正：只检测真正显著的闭合动作
+        # 只检测真正显著的闭合动作
         for t in range(1, len(gripper_delta)):
             # 条件1：变化为负且超过阈值（闭合动作）
             is_closing = gripper_delta[t] < self.gripper_close_delta_threshold
             
-            # 条件2：变化量足够大，排除数值误差 (1%的变化才认为是真实动作)
+            # 条件2：变化量足够大，排除数值误差
             is_significant = abs(gripper_delta[t]) > 0.01
             
-            # 条件3：确保不是从0开始的误判（防止初始值问题）
+            # 条件3：确保不是从0开始的误判
             is_valid_timing = t > 0
             
             if is_closing and is_significant and is_valid_timing:
@@ -216,7 +243,7 @@ class TaskDrivenCriticalTimestepAnnotator:
                 if self.verbose:
                     print(f"    🤏 {arm_name}臂夹爪开始闭合: 步骤 {t}, 开度={gripper_trajectory[t]:.4f}, 变化量={gripper_delta[t]:.4f}")
         
-        # 🔧 改进去重：如果连续多个时间点都检测到闭合，只保留第一个
+        # 改进去重：如果连续多个时间点都检测到闭合，只保留第一个
         if len(gripper_close_points) > 1:
             filtered_points = [gripper_close_points[0]]
             for point in gripper_close_points[1:]:
@@ -265,29 +292,21 @@ class TaskDrivenCriticalTimestepAnnotator:
                                        arm_name: str) -> Optional[Tuple[int, int]]:
         """
         抓取模式：简化检测流程
-        🔧 1. 找到第一个减速点
-        🔧 2. 在减速点之后找到第一个夹爪闭合点
-        🔧 3. 两点之间即为关键时间段
-        
-        Args:
-            gripper_points: 夹爪闭合时间点
-            decel_points: 减速低速时间点
-            arm_name: 机械臂名称
-            
-        Returns:
-            critical_segment: (start, end) 或 None
+        1. 找到第一个减速点
+        2. 在减速点之后找到第一个夹爪闭合点
+        3. 两点之间即为关键时间段
         """
         if not gripper_points or not decel_points:
             if self.verbose:
                 print(f"    ❌ {arm_name}臂抓取模式：缺少关键点（夹爪点:{len(gripper_points)}, 减速点:{len(decel_points)}）")
             return None
         
-        # 🔧 步骤1：找到第一个减速点
+        # 步骤1：找到第一个减速点
         first_decel_point = min(decel_points)
         if self.verbose:
             print(f"    🎯 {arm_name}臂第一个减速点: 步骤 {first_decel_point}")
         
-        # 🔧 步骤2：在减速点之后找到第一个夹爪闭合点
+        # 步骤2：在减速点之后找到第一个夹爪闭合点
         following_gripper_points = [gp for gp in gripper_points if gp > first_decel_point]
         
         if not following_gripper_points:
@@ -299,7 +318,7 @@ class TaskDrivenCriticalTimestepAnnotator:
         if self.verbose:
             print(f"    🤏 {arm_name}臂减速后第一个夹爪闭合点: 步骤 {first_gripper_point}")
         
-        # 🔧 步骤3：两点之间即为关键时间段
+        # 步骤3：两点之间即为关键时间段
         start_point = first_decel_point
         end_point = first_gripper_point
         
@@ -313,29 +332,21 @@ class TaskDrivenCriticalTimestepAnnotator:
                                        arm_name: str) -> Optional[Tuple[int, int]]:
         """
         点击模式：简化检测流程
-        🔧 1. 找到第一个夹爪闭合点
-        🔧 2. 在夹爪闭合点之后找到第一个减速点
-        🔧 3. 两点之间即为关键时间段
-        
-        Args:
-            gripper_points: 夹爪闭合时间点
-            decel_points: 减速低速时间点
-            arm_name: 机械臂名称
-            
-        Returns:
-            critical_segment: (start, end) 或 None
+        1. 找到第一个夹爪闭合点
+        2. 在夹爪闭合点之后找到第一个减速点
+        3. 两点之间即为关键时间段
         """
         if not gripper_points or not decel_points:
             if self.verbose:
                 print(f"    ❌ {arm_name}臂点击模式：缺少关键点（夹爪点:{len(gripper_points)}, 减速点:{len(decel_points)}）")
             return None
         
-        # 🔧 步骤1：找到第一个夹爪闭合点
+        # 步骤1：找到第一个夹爪闭合点
         first_gripper_point = min(gripper_points)
         if self.verbose:
             print(f"    🤏 {arm_name}臂第一个夹爪闭合点: 步骤 {first_gripper_point}")
         
-        # 🔧 步骤2：在夹爪闭合点之后找到第一个减速点
+        # 步骤2：在夹爪闭合点之后找到第一个减速点
         following_decel_points = [dp for dp in decel_points if dp > first_gripper_point]
         
         if not following_decel_points:
@@ -347,7 +358,7 @@ class TaskDrivenCriticalTimestepAnnotator:
         if self.verbose:
             print(f"    🎯 {arm_name}臂夹爪闭合后第一个减速点: 步骤 {first_decel_point}")
         
-        # 🔧 步骤3：两点之间即为关键时间段
+        # 步骤3：两点之间即为关键时间段
         start_point = first_gripper_point
         end_point = first_decel_point
         
@@ -400,15 +411,82 @@ class TaskDrivenCriticalTimestepAnnotator:
         
         return critical_segment
     
-    def annotate(self, qpos_trajectory: np.ndarray) -> Tuple[np.ndarray, Dict]:
+    # 🆕 新增：随机标注方法
+    def _annotate_random(self, qpos_trajectory: np.ndarray) -> Tuple[np.ndarray, Dict]:
         """
-        主标注函数：基于任务类型的智能关键时间段标注
+        🆕 随机标注模式：每个时间步独立随机判定
         
         Args:
             qpos_trajectory: (T, 14) 关节角度轨迹
             
         Returns:
-            critical_labels: (T,) 关键时间段标签 (0/1)
+            critical_labels: (T,) 随机标签 (0/1)
+            analysis_info: 分析信息字典
+        """
+        T = len(qpos_trajectory)
+        
+        if self.verbose:
+            print(f"🎲 开始随机标注 (目标比例: {self.random_critical_ratio:.1%})")
+            print("=" * 50)
+        
+        # 设置随机种子（如果提供）
+        if self.random_seed is not None:
+            np.random.seed(self.random_seed)
+        
+        # 为每个时间步独立随机判定
+        critical_labels = (np.random.rand(T) < self.random_critical_ratio).astype(int)
+        
+        critical_count = np.sum(critical_labels)
+        actual_ratio = critical_count / T
+        
+        # 生成分析信息
+        analysis_info = {
+            'task_type': self.task_type,
+            'task_name': '随机标注',
+            'annotation_mode': 'random',
+            'left_segment': None,
+            'right_segment': None,
+            'all_segments': [],
+            'left_ee_positions': None,
+            'right_ee_positions': None,
+            'left_gripper': qpos_trajectory[:, 6],
+            'right_gripper': qpos_trajectory[:, 13],
+            'statistics': {
+                'total_steps': T,
+                'critical_steps': int(critical_count),
+                'critical_ratio': float(actual_ratio),
+                'target_ratio': self.random_critical_ratio,
+                'left_has_segment': False,
+                'right_has_segment': False,
+                'total_segments': 0,
+                'config': {
+                    'annotation_mode': 'random',
+                    'random_critical_ratio': self.random_critical_ratio,
+                    'random_seed': self.random_seed,
+                }
+            }
+        }
+        
+        if self.verbose:
+            print(f"\n📊 随机标注结果:")
+            print(f"  总步数: {T}")
+            print(f"  关键步数: {critical_count}")
+            print(f"  实际比例: {actual_ratio:.3f}")
+            print(f"  目标比例: {self.random_critical_ratio:.3f}")
+            print(f"  偏差: {abs(actual_ratio - self.random_critical_ratio):.3f}")
+        
+        return critical_labels, analysis_info
+    
+    # 🆕 修改：任务驱动标注方法（从原 annotate 中分离出来）
+    def _annotate_task_driven(self, qpos_trajectory: np.ndarray) -> Tuple[np.ndarray, Dict]:
+        """
+        任务驱动标注模式（原有逻辑）
+        
+        Args:
+            qpos_trajectory: (T, 14) 关节角度轨迹
+            
+        Returns:
+            critical_labels: (T,) 标签 (0/1)
             analysis_info: 分析信息字典
         """
         task_name = "抓取类" if self.task_type == TaskType.GRASP else "点击类"
@@ -421,8 +499,8 @@ class TaskDrivenCriticalTimestepAnnotator:
         left_ee_pos, right_ee_pos = self.fk_calculator.compute_end_effector_positions(qpos_trajectory)
         
         # 2. 提取夹爪轨迹
-        left_gripper = qpos_trajectory[:, 6]   # 左臂夹爪（第7列）
-        right_gripper = qpos_trajectory[:, 13]  # 右臂夹爪（第14列）
+        left_gripper = qpos_trajectory[:, 6]
+        right_gripper = qpos_trajectory[:, 13]
         
         # 3. 双臂独立标注
         left_segment = self.annotate_single_arm(left_ee_pos, left_gripper, "左")
@@ -458,6 +536,7 @@ class TaskDrivenCriticalTimestepAnnotator:
         analysis_info = {
             'task_type': self.task_type,
             'task_name': task_name,
+            'annotation_mode': 'task_driven',
             'left_segment': left_segment,
             'right_segment': right_segment,
             'all_segments': segments,
@@ -481,7 +560,6 @@ class TaskDrivenCriticalTimestepAnnotator:
             }
         }
         
-        
         if self.verbose:
             print(f"\n📊 标注结果:")
             print(f"  任务类型: {task_name}")
@@ -499,15 +577,50 @@ class TaskDrivenCriticalTimestepAnnotator:
                     print(f"    {arm}臂: 步骤 {start}-{end} (持续{duration}步)")
         
         return critical_labels, analysis_info
+    
+    # 🆕 修改：主标注函数，根据模式调用不同方法
+    def annotate(self, qpos_trajectory: np.ndarray) -> Tuple[np.ndarray, Dict]:
+        """
+        主标注函数：基于配置选择标注模式
+        
+        Args:
+            qpos_trajectory: (T, 14) 关节角度轨迹
+            
+        Returns:
+            critical_labels: (T,) 关键时间段标签 (0/1)
+            analysis_info: 分析信息字典
+        """
+        # 🆕 根据模式选择标注方法
+        if self.use_random_annotation:
+            return self._annotate_random(qpos_trajectory)
+        else:
+            return self._annotate_task_driven(qpos_trajectory)
 
 
-def create_task_annotator(task_type: TaskType, verbose: bool = False):
-    """创建任务驱动标注器的工厂函数"""
+# 🆕 修改：工厂函数，支持随机模式
+def create_task_annotator(task_type: TaskType, 
+                         use_random: bool = False,
+                         random_ratio: float = 0.3,
+                         random_seed: Optional[int] = None,
+                         verbose: bool = False):
+    """
+    创建任务驱动标注器的工厂函数
+    
+    Args:
+        task_type: 任务类型
+        use_random: 是否使用随机标注
+        random_ratio: 随机标注的关键帧比例
+        random_seed: 随机种子
+        verbose: 是否打印详细信息
+    """
     return TaskDrivenCriticalTimestepAnnotator(
         task_type=task_type,
+        use_random_annotation=use_random,
+        random_critical_ratio=random_ratio,
+        random_seed=random_seed,
         relative_low_speed_ratio=0.15,
         min_deceleration_threshold=-0.0008,
-        gripper_close_delta_threshold=-0.01,  # 🔧 夹爪闭合变化阈值
+        gripper_close_delta_threshold=-0.01,
         smooth=True,
         verbose=verbose
     )
@@ -567,6 +680,55 @@ def process_hdf5_file_with_task(file_path: str, task_type: TaskType) -> Dict:
         }
 
 
+# 🆕 新增：测试随机标注
+def test_random_annotation():
+    """测试随机标注模式"""
+    print("🎲 测试随机标注模式")
+    print("=" * 60)
+    
+    # 创建随机标注器
+    annotator = TaskDrivenCriticalTimestepAnnotator(
+        task_type=TaskType.GRASP,
+        use_random_annotation=True,
+        random_critical_ratio=0.3,
+        random_seed=42,
+        verbose=True
+    )
+    
+    # 创建测试数据
+    T = 100
+    test_qpos = np.random.randn(T, 14)
+    
+    # 执行标注
+    labels, info = annotator.annotate(test_qpos)
+    
+    print(f"\n✅ 随机标注测试结果:")
+    print(f"   总步数: {info['statistics']['total_steps']}")
+    print(f"   关键步数: {info['statistics']['critical_steps']}")
+    print(f"   实际比例: {info['statistics']['critical_ratio']:.3f}")
+    print(f"   目标比例: {info['statistics']['target_ratio']:.3f}")
+    
+    # 验证标签分布
+    assert len(labels) == T
+    assert set(np.unique(labels)).issubset({0, 1})
+    print(f"   标签验证: ✓")
+    
+    # 测试可复现性
+    annotator2 = TaskDrivenCriticalTimestepAnnotator(
+        task_type=TaskType.GRASP,
+        use_random_annotation=True,
+        random_critical_ratio=0.3,
+        random_seed=42,
+        verbose=False
+    )
+    labels2, _ = annotator2.annotate(test_qpos)
+    
+    if np.array_equal(labels, labels2):
+        print(f"   可复现性: ✓ (相同种子产生相同标签)")
+    else:
+        print(f"   可复现性: ✗ (警告:标签不一致)")
+
+
 def test_task_annotators():
     """测试不同任务类型的标注器"""
     print("🧪 任务驱动关键时间段标注器测试")
@@ -589,7 +751,7 @@ def test_task_annotators():
                         full_path = os.path.join(root, file)
                         test_files.append(full_path)
                         print(f"  找到: {full_path}")
-                        if len(test_files) >= 2:  # 只需要2个测试文件
+                        if len(test_files) >= 2:
                             break
                 if len(test_files) >= 2:
                     break
@@ -611,7 +773,7 @@ def test_task_annotators():
     print("-" * 80)
     
     for task_type, task_name in test_configs:
-        for i, file_path in enumerate(test_files[:1]):  # 每种任务测试1个文件
+        for i, file_path in enumerate(test_files[:1]):
             result = process_hdf5_file_with_task(file_path, task_type)
             
             if result['success']:
@@ -628,19 +790,6 @@ def test_task_annotators():
                 print(f"{task_name:8s} | {file_short:20s} | {'错误':6s} | {'错误':6s} | {'0':6s} | {'0.000':7s} | 失败")
     
     print(f"\n✅ 测试完成!")
-    print(f"💡 任务驱动标注说明:")
-    print(f"   📊 抓取类任务 (task_type=1):")
-    print(f"      - 检测逻辑: 减速对准 → 夹爪闭合")
-    print(f"      - 关键时间段: 从减速低速点到夹爪闭合点")
-    print(f"      - 适用场景: 精细抓取、物体操纵")
-    print(f"   🖱️ 点击类任务 (task_type=2):")
-    print(f"      - 检测逻辑: 夹爪闭合 → 减速对准")
-    print(f"      - 关键时间段: 从夹爪闭合点到减速低速点")
-    print(f"      - 适用场景: 按钮点击、触摸交互")
-    print(f"   🤖 双臂策略:")
-    print(f"      - 每臂独立检测，最多一个关键时间段")
-    print(f"      - 任何一臂处于关键时间段即为关键时间段")
-    print(f"      - 支持双臂协调操作的标注")
 
 
 if __name__ == "__main__":
@@ -649,6 +798,8 @@ if __name__ == "__main__":
     if len(sys.argv) == 1:
         # 无参数时运行测试
         test_task_annotators()
+        print("\n" + "=" * 60)
+        test_random_annotation()  # 🆕 新增随机标注测试
     else:
         # 命令行参数处理
         import argparse
@@ -657,6 +808,10 @@ if __name__ == "__main__":
         parser.add_argument("--task_type", type=int, choices=[1, 2], required=True, 
                           help="任务类型: 1=抓取类, 2=点击类")
         parser.add_argument("--verbose", action="store_true", help="显示详细信息")
+        # 🆕 新增随机标注参数
+        parser.add_argument("--random", action="store_true", help="使用随机标注模式")
+        parser.add_argument("--random_ratio", type=float, default=0.3, help="随机标注关键帧比例")
+        parser.add_argument("--seed", type=int, help="随机种子")
         
         args = parser.parse_args()
         
@@ -679,13 +834,23 @@ if __name__ == "__main__":
 
 
 # 🆕 集成到数据集的便捷函数
-def create_silent_task_annotator(task_type: TaskType):
-    """创建静默的任务标注器（用于训练）"""
+def create_silent_task_annotator(task_type: TaskType, 
+                                use_random: bool = False,
+                                random_ratio: float = 0.3,
+                                random_seed: Optional[int] = None):
+    """
+    创建静默的任务标注器（用于训练）
+    
+    🆕 支持随机标注模式
+    """
     return TaskDrivenCriticalTimestepAnnotator(
         task_type=task_type,
+        use_random_annotation=use_random,
+        random_critical_ratio=random_ratio,
+        random_seed=random_seed,
         relative_low_speed_ratio=0.15,
         min_deceleration_threshold=-0.0008,
-        gripper_close_delta_threshold=0.01,  # 🔧 夹爪闭合变化阈值  
+        gripper_close_delta_threshold=0.01,
         smooth=True,
-        verbose=False  # 🔧 关闭所有打印信息
+        verbose=False  # 关闭所有打印信息
     )
